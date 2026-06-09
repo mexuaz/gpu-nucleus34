@@ -1,0 +1,14 @@
+{
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "[cuda-cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools"
+  },
+  "editor.formatOnSaveMode": "modificationsIfAvailable",
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "ms-vscode.cpptools"
+}
