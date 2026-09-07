@@ -255,3 +255,10 @@ install(
 	cuNucleus34
 	RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX})
 
+
+add_executable(cuNucleus34_ondemand cuNucleus34_ondemand.cu)
+# -lgomp used for openmp in host code
+target_link_libraries(cuNucleus34 PRIVATE
+	CUDA::cuda_driver
+	utils)
+
