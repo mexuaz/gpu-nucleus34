@@ -161,6 +161,8 @@ ENDIF()
 #=====================================================
 # Add current folder to current directory
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+# cpuinfo.hpp, ioutils.hpp and json.h are included unqualified by the sources
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/utility)
 
 #=====================================================
 # Threading
@@ -189,6 +191,13 @@ add_subdirectory(utility)
 
 #======================================================
 # CUDA
+# Compute capability of the target GPU: 90 is Hopper (H100). Pass a
+# semicolon-separated list to build a fat binary, e.g.
+# -DCMAKE_CUDA_ARCHITECTURES="80;90". This must be set before
+# enable_language(CUDA), which otherwise fills the cache with the
+# architecture of whatever GPU the build host happens to have.
+set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA Architectures")
+
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
 
@@ -224,12 +233,7 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-extended-lambda --expt-relaxed-
 
 message(STATUS "CUDA Standard: "	"${CMAKE_CUDA_STANDARD}" )
 
-# This defines the flag in cache
-set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90 CACHE STRING "CUDA Architectures")
-
-# This sets the actual architecture
-set(CMAKE_CUDA_ARCHITECTURES 90)
-message("CUDA Architecture: ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "CUDA Architecture: ${CMAKE_CUDA_ARCHITECTURES}")
 
 # Detect CUDA architecture and get best NVCC flags
 #INCLUDE(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FindCudaArch.cmake)
@@ -258,7 +262,12 @@ install(
 
 add_executable(cuNucleus34_ondemand cuNucleus34_ondemand.cu)
 # -lgomp used for openmp in host code
-target_link_libraries(cuNucleus34 PRIVATE
+target_link_libraries(cuNucleus34_ondemand PRIVATE
 	CUDA::cuda_driver
 	utils)
+
+install(
+	TARGETS
+	cuNucleus34_ondemand
+	RUNTIME DESTINATION ${CMAKE_INSTALL_PREFIX})
 

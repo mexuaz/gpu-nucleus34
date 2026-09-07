@@ -2,11 +2,10 @@ cmake_minimum_required(VERSION 3.25 FATAL_ERROR)
 
 project(nucleus)
 
-enable_testing()
-
 include(ExternalProject)
 
 set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build.")
+set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA Architectures")
 
 #======================================================
 # Intel oneTBB (Threading Building Blocks)
@@ -99,6 +98,16 @@ endforeach()
 
 #======================================================
 # Nuclues Project
+
+# Build options of the inner project, declared here so that they can be given
+# on the super-build command line (e.g. cmake .. -DExecutionPolicy=par) and
+# forwarded below. Defaults must match nucleus/CMakeLists.txt.
+set(ExecutionPolicy "parunseq" CACHE STRING "STD Execution Policy.")
+set_property(CACHE ExecutionPolicy PROPERTY STRINGS seq par parunseq unseq)
+set(VertexType "unsigned" CACHE STRING "Vertex data type")
+set(EdgeType "unsigned" CACHE STRING "Edge data type")
+set(MultiArrangeType "mr_int" CACHE STRING "multi arrange data type")
+
 set(_NUCLEUS_DIR "${CMAKE_CURRENT_BINARY_DIR}/nucleus" CACHE PATH "Nucleus project root directory")
 set(_NUCLEUS_INSTALL_DIR "${_NUCLEUS_DIR}/install" CACHE PATH "Nucleus project install directory")
 
@@ -111,21 +120,27 @@ ExternalProject_Add(gpuNucleus34
 	"-DCMAKE_BUILD_TYPE:STRING=${CMAKE_BUILD_TYPE}"
 	"-DCMAKE_INSTALL_PREFIX:STRING=${_NUCLEUS_INSTALL_DIR}" 
     "-DONETBB_PATH:STRING=${_ONETBB_INSTALL_DIR}"
+    "-DCMAKE_CUDA_ARCHITECTURES:STRING=${CMAKE_CUDA_ARCHITECTURES}"
+    "-DExecutionPolicy:STRING=${ExecutionPolicy}"
+    "-DVertexType:STRING=${VertexType}"
+    "-DEdgeType:STRING=${EdgeType}"
+    "-DMultiArrangeType:STRING=${MultiArrangeType}"
     "-DDATASETS:STRING=${DATASET_FILES}"
 	"-DDATASETS_DIR:PATH=${DATASETS_DIR}"
 )
 
+# When oneTBB is built from source it must be installed before the inner
+# project configures, otherwise its find_package(TBB REQUIRED) fails.
+if(NOT TBB_FOUND)
+	ExternalProject_Add_StepDependencies(gpuNucleus34 configure intel_onetbb)
+endif()
 
-# Expose inner-project tests to the super-build CTest tree.
+
 ExternalProject_Get_Property(gpuNucleus34 BINARY_DIR)
-file(RELATIVE_PATH NUCLEUS_BIN_REL_PATH "${CMAKE_CURRENT_BINARY_DIR}" "${BINARY_DIR}")
 
-# To ensure this doesn't overwrite with a new file, we append in the build step instead of the configure step
-add_custom_command(TARGET gpuNucleus34 POST_BUILD
-		COMMAND echo "subdirs\\\(\\\"${NUCLEUS_BIN_REL_PATH}\\\"\\\)" >> "${CMAKE_CURRENT_BINARY_DIR}/CTestTestfile.cmake")
-
-# Proxy target: forward only the CUDA nucleus executable from the inner project.
-foreach(_inner_target cuNucleus34)
+# Proxy targets: forward the CUDA executables from the inner project, e.g.
+# `cmake --build build --target cuNucleus34_ondemand`.
+foreach(_inner_target cuNucleus34 cuNucleus34_ondemand)
     add_custom_target(${_inner_target}
         COMMAND ${CMAKE_COMMAND} --build ${BINARY_DIR} --target ${_inner_target}
         COMMENT "Building inner-project target: ${_inner_target}"

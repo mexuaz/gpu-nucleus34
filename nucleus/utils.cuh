@@ -1,4 +1,7 @@
-#include <map>
+#include <unordered_map>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
 
 #include "utility/defs.hpp"
 #include "utility/def_ver.hpp"
@@ -7,11 +10,14 @@
 #include <cuda_runtime_api.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/extrema.h> // max_element
-#include <thrust/remove.h> // remove remove_if
-#include <thrust/sort.h> // sort
-#include <thrust/copy.h> // copy
-#include <thrust/count.h> // count_if
+#include <thrust/extrema.h>					   // max_element
+#include <thrust/remove.h>					   // remove remove_if
+#include <thrust/sort.h>					   // sort
+#include <thrust/copy.h>					   // copy
+#include <thrust/count.h>					   // count_if
+#include <thrust/gather.h>					   // gather
+#include <thrust/transform.h>				   // transform
+#include <thrust/iterator/counting_iterator.h> // counting_iterator
 #include <mutex>
 #include <thread>
 
@@ -22,55 +28,87 @@
 // Maximum thread per block in cuda
 #define MAX_THRD_BLK 1024
 
-#define CU_ERR(err_no) { cu_error((err_no), __FILE__, __LINE__); }
+#define CU_ERR(err_no)                          \
+	{                                           \
+		cu_error((err_no), __FILE__, __LINE__); \
+	}
+
+// Warp-aggregated atomic increment on a global `unsigned` counter.
+// Returns the per-thread output index allocated for the calling thread.
+// Reduces contention on the global atomic by a factor of up to 32x by
+// having one lane per active warp perform a single atomicAdd of the warp
+// population count. Critical for H100 where atomic latency dominates the
+// triangle/four-clique enumeration output step.
+__device__ inline unsigned warp_aggregated_add(unsigned *counter, unsigned inc = 1u)
+{
+	unsigned mask = __activemask();
+	unsigned warp_count = __popc(mask);
+	unsigned leader = __ffs(mask) - 1u;
+	unsigned lane = threadIdx.x & 31u;
+	unsigned base = 0u;
+	if (lane == leader)
+	{
+		base = atomicAdd(counter, warp_count * inc);
+	}
+	base = __shfl_sync(mask, base, leader);
+	unsigned rank = __popc(mask & ((1u << lane) - 1u));
+	return base + rank * inc;
+}
 
 inline void cu_error(cudaError_t code,
-	const char *file,
-	int line,
-	bool abort=true)
+					 const char *file,
+					 int line,
+					 bool abort = true)
 {
-   if (code != cudaSuccess) 
-   {
-      fprintf(stderr, "CUDA Error: %s %s %d\n",
-	  	cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
+	if (code != cudaSuccess)
+	{
+		fprintf(stderr, "CUDA Error: %s %s %d\n",
+				cudaGetErrorString(code), file, line);
+		if (abort)
+			exit(code);
+	}
 }
-
 
 template <typename T>
-inline int blocks(const T& nThreads) {
-	if(!nThreads) {
+inline int blocks(const T &nThreads)
+{
+	if (!nThreads)
+	{
 		return 1; // This function shouldn't return zero
 	}
-	return static_cast<int>(nThreads/MAX_THRD_BLK) +
-		   static_cast<int>
-		   (static_cast<int>(nThreads)%MAX_THRD_BLK > 0);
+	return static_cast<int>(nThreads / MAX_THRD_BLK) +
+		   static_cast<int>(static_cast<int>(nThreads) % MAX_THRD_BLK > 0);
 }
 
-struct dbl_t {
+struct dbl_t
+{
 	VERTEX_T a = 0;
 	VERTEX_T b = 0;
-	__host__ __device__ bool operator<(const dbl_t& t) const {
+	__host__ __device__ bool operator<(const dbl_t &t) const
+	{
 		return a < t.a || (a == t.a && b < t.b);
 	}
 };
 
-struct tri_t {
+struct tri_t
+{
 	VERTEX_T a = 0;
 	VERTEX_T b = 0;
 	VERTEX_T c = 0;
-	__host__ __device__ bool operator<(const tri_t& t) const {
+	__host__ __device__ bool operator<(const tri_t &t) const
+	{
 		return a < t.a || (a == t.a && b < t.b);
 	}
 };
 
-struct qud_t {
+struct qud_t
+{
 	VERTEX_T a = 0;
 	VERTEX_T b = 0;
 	VERTEX_T c = 0;
 	VERTEX_T d = 0;
-	__host__ __device__ bool operator<(const qud_t& q) const {
+	__host__ __device__ bool operator<(const qud_t &q) const
+	{
 		return a < q.a || (a == q.a && b < q.b);
 	}
 };
@@ -82,62 +120,60 @@ __device__ unsigned d_2peel_next;
 __device__ unsigned d_peeled;
 
 template <typename T>
-std::ostream& operator<< (std::ostream& out,
-			  const thrust::device_vector<T>& v) {
-    out << "[ ";
-    thrust::copy (v.cbegin(), v.cend(), std::ostream_iterator<T>(out, " "));
-    out << ']';
-  return out;
+std::ostream &operator<<(std::ostream &out,
+						 const thrust::device_vector<T> &v)
+{
+	out << "[ ";
+	thrust::copy(v.cbegin(), v.cend(), std::ostream_iterator<T>(out, " "));
+	out << ']';
+	return out;
 }
 
-std::ostream& operator<< (std::ostream& out, const dim3& d) {
-    out << "("	<< d.x << "," << d.y << "," << d.z <<")";
-  return out;
+std::ostream &operator<<(std::ostream &out, const dim3 &d)
+{
+	out << "(" << d.x << "," << d.y << "," << d.z << ")";
+	return out;
 }
 
-std::ostream& operator<< (std::ostream& out, const tri_t& t) {
-    out << "("	<< t.a << "," << t.b << "," << t.c <<")";
-  return out;
+std::ostream &operator<<(std::ostream &out, const tri_t &t)
+{
+	out << "(" << t.a << "," << t.b << "," << t.c << ")";
+	return out;
 }
 
-std::ostream& operator<< (std::ostream& out, const qud_t& q) {
-    out << "("	<< q.a << "," << q.b << ","
-		<< q.c << "," << q.d <<")";
-  return out;
+std::ostream &operator<<(std::ostream &out, const qud_t &q)
+{
+	out << "(" << q.a << "," << q.b << ","
+		<< q.c << "," << q.d << ")";
+	return out;
 }
 
-__global__
-void initialize_kernel() {
+__global__ void initialize_kernel()
+{
 	d_global_num_triangles = 0;
 	d_global_num_4cliques = 0;
 }
 
 /**
  * Materialises the CSR graph data for the endpoint of each edge.
- * 
+ *
  * Consider an edge e=(u,v). The thread handling edge e will
  * materialise the degree and offset for v at a unique index corresponding to the thread/edge id.
  * For example, in a graph 0<-1<-2, vertex_degrees would be [0,1,1],
  * neighbour_offsets would be [0,0,1] and edge_destinations would be [0,1].
  * The result of this would also be of length E and would produce for [(1,0), (2,1)]
  * degree vector [0,1] and offset vector [0,0].
- * 
+ *
  * @TODO Store these results in shared memory instead?
- */ 
-__global__
-void cuTake( VERTEX_T const* vertex_degrees
-           , EDGE_T   const* neighbour_offsets
-           , VERTEX_T const* edge_destinations
-           , VERTEX_T      * edge_endpoint_degrees
-           , EDGE_T        * edge_endpoint_offsets
-           , std::size_t num_edges )
+ */
+__global__ void cuTake(VERTEX_T const *vertex_degrees, EDGE_T const *neighbour_offsets, VERTEX_T const *edge_destinations, VERTEX_T *edge_endpoint_degrees, EDGE_T *edge_endpoint_offsets, std::size_t num_edges)
 {
 	auto const edge = blockIdx.x * blockDim.x + threadIdx.x;
 
-	if( edge < num_edges )
-    {
-        edge_endpoint_degrees[ edge ] =    vertex_degrees[ edge_destinations[ edge ] ];
-		edge_endpoint_offsets[ edge ] = neighbour_offsets[ edge_destinations[ edge ] ];
+	if (edge < num_edges)
+	{
+		edge_endpoint_degrees[edge] = vertex_degrees[edge_destinations[edge]];
+		edge_endpoint_offsets[edge] = neighbour_offsets[edge_destinations[edge]];
 	}
 }
 
@@ -147,27 +183,29 @@ void cuTake( VERTEX_T const* vertex_degrees
  * @param v_sz size of input vector
  * @param D must have a length equal to maximum value of vector v
  */
- 
-__global__
-void cu_build_D(
-		VERTEX_T* v,
-		size_t v_sz,
-		VERTEX_T* D) {
+
+__global__ void cu_build_D(
+	VERTEX_T *v,
+	size_t v_sz,
+	VERTEX_T *D)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < v_sz) {
-		auto& d = D[v[i]];
+	if (i < v_sz)
+	{
+		auto &d = D[v[i]];
 		atomicAdd(&d, 1);
 	}
 }
 
-__global__
-void cu_build_dblsD(
-		dbl_t* dbls,
-		size_t dbls_sz,
-		VERTEX_T* dblsD) {
+__global__ void cu_build_dblsD(
+	dbl_t *dbls,
+	size_t dbls_sz,
+	VERTEX_T *dblsD)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < dbls_sz) {
-		auto& v = dblsD[dbls[i].a];
+	if (i < dbls_sz)
+	{
+		auto &v = dblsD[dbls[i].a];
 		atomicAdd(&v, 1);
 	}
 }
@@ -175,39 +213,36 @@ void cu_build_dblsD(
 /**
  * Calculates the degree of every source vertex in the triangles graph
  */
-__global__
-void cu_build_trisD( tri_t const * tris
-                   , std::size_t   num_triangles
-                   , VERTEX_T    * trisD )
+__global__ void cu_build_trisD(tri_t const *tris, std::size_t num_triangles, VERTEX_T *trisD)
 {
-	auto triangle_id = static_cast< std::size_t >( blockIdx.x * blockDim.x + threadIdx.x );
-	if( triangle_id < num_triangles )
-    {
-        VERTEX_T const first_vertex_of_triangle = tris[ triangle_id ].a; 
+	auto triangle_id = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+	if (triangle_id < num_triangles)
+	{
+		VERTEX_T const first_vertex_of_triangle = tris[triangle_id].a;
 		auto ptr_num_triangles_starting_with_this_vertex = trisD + first_vertex_of_triangle;
-		atomicAdd( ptr_num_triangles_starting_with_this_vertex, 1 );
+		atomicAdd(ptr_num_triangles_starting_with_this_vertex, 1);
 	}
 }
 
-__global__
-void cu_build_qudsD(
-		qud_t* quds,
-		size_t quds_sz,
-		VERTEX_T* qudsD) {
+__global__ void cu_build_qudsD(
+	qud_t *quds,
+	size_t quds_sz,
+	VERTEX_T *qudsD)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < quds_sz) {
-		auto& v = qudsD[quds[i].a];
+	if (i < quds_sz)
+	{
+		auto &v = qudsD[quds[i].a];
 		atomicAdd(&v, 1);
 	}
 }
 
-__device__
-auto get_range_from_offsets( VERTEX_T vertex_id, EDGE_T * offset_array, std::size_t num_offsets, std::size_t max_offset )
-	-> std::pair< EDGE_T, EDGE_T >
+__device__ auto get_range_from_offsets(VERTEX_T vertex_id, EDGE_T *offset_array, std::size_t num_offsets, std::size_t max_offset)
+	-> std::pair<EDGE_T, EDGE_T>
 {
-	EDGE_T const start = offset_array[ vertex_id ];
-	EDGE_T const end   = vertex_id < num_offsets - 1 ? offset_array[ vertex_id + 1 ] : max_offset;
-	return std::make_pair( start, end );
+	EDGE_T const start = offset_array[vertex_id];
+	EDGE_T const end = vertex_id < num_offsets - 1 ? offset_array[vertex_id + 1] : max_offset;
+	return std::make_pair(start, end);
 }
 
 /**
@@ -215,49 +250,43 @@ auto get_range_from_offsets( VERTEX_T vertex_id, EDGE_T * offset_array, std::siz
  * [list2_start, list2_end) after applying one level of indirection
  * to elements in the second list. Appends results to a
  * globally shared list using a global, atomic tail counter.
- * 
+ *
  * @note Result produced by this thread are not guaranteed to be
  * contiguous in the output array
  * @precondition: both lists must be sorted
  * @complexity: linear in the length of the largest list
  */
-__device__
-void intersect_lists( 
-	  VERTEX_T * list1_start
-	, VERTEX_T * list1_end
-	, MTYPE    * list2_start
-	, MTYPE    * list2_end
-	, VERTEX_T * list2_indirection_array // to retrieve destination given edge index !!! 
-	, tri_t   && new_triangle
-	, tri_t    * output_array
-	, std::size_t max_output_capacity )
+__device__ void intersect_lists(
+	VERTEX_T *list1_start, VERTEX_T *list1_end, MTYPE *list2_start, MTYPE *list2_end, VERTEX_T *list2_indirection_array // to retrieve destination given edge index !!!
+	,
+	tri_t &&new_triangle, tri_t *output_array, std::size_t max_output_capacity)
 {
 	// uses standard "zipper" algorithm for intersecting two lists
 	// Loop through, advancing the pointer that points to the smallest element
-    // Lists must be sorted in advance!
-	while( list1_start < list1_end && list2_start < list2_end )
+	// Lists must be sorted in advance!
+	while (list1_start < list1_end && list2_start < list2_end)
 	{
 		const auto p = *list1_start;
-		const auto o = static_cast< VERTEX_T >( *list2_start );
-		const auto q = list2_indirection_array[ o ];               // NON-LOCAL READ, BUT TO IMMUTABLE !!!
+		const auto o = static_cast<VERTEX_T>(*list2_start);
+		const auto q = list2_indirection_array[o]; // NON-LOCAL READ, BUT TO IMMUTABLE !!!
 
-		if( p < q )
+		if (p < q)
 		{
 			++list1_start;
 		}
 		else
 		{
-			if( p == q ) // Found match!
+			if (p == q) // Found match!
 			{
 				// a = i1: the actual matching edge index in list1 (mirrors CPU {i1, d, o})
-				new_triangle.a = static_cast< VERTEX_T >( list1_start - list2_indirection_array );
+				new_triangle.a = static_cast<VERTEX_T>(list1_start - list2_indirection_array);
 				new_triangle.c = o; // complete triangle with the common neighbour
-				auto const output_array_tail = atomicAdd( &d_global_num_triangles, 1ul );
-				if( output_array_tail < max_output_capacity )
+				auto const output_array_tail = warp_aggregated_add(&d_global_num_triangles);
+				if (output_array_tail < max_output_capacity)
 				{
-					output_array[ output_array_tail ] = new_triangle;
+					output_array[output_array_tail] = new_triangle;
 				}
-                // else we didn't allocate enough space and the answer is wrong!
+				// else we didn't allocate enough space and the answer is wrong!
 				++list1_start; // always advance on match, mirrors CPU version
 			}
 			++list2_start;
@@ -269,25 +298,31 @@ void intersect_lists(
  * Calculates all triangles in the graph from CSR representations
  * of the graph and of length-two paths in the graph and stores the
  * result in `tris`
- * 
+ *
  * [neighbour_offsets, edge_destinations] is the CSR representation of the original graph;
  * [path_offsets, path_destinations] is CSR of edges (u,v) represented by v and all
  * nodes w, u=/=w, connected to v.
  */
-__global__
-void cu_cliques_tris( VERTEX_T  * edge_destinations // formerly "E"
-					, EDGE_T    * neighbour_offsets // formerly "O"
-					, MTYPE     * path_destinations // formerly "M"  <---- no, index of edge!!!
-					, EDGE_T    * path_offsets      // formerly "N"
-					, std::size_t num_edges         // formerly "ESize"
-					, std::size_t num_vertices      // formerly "OSize"
-					, tri_t     * tris              // vector to store triangles results
-					, std::size_t tris_capacity     // max capacity of triangles vector
-					)
+__global__ void cu_cliques_tris(VERTEX_T *edge_destinations // formerly "E"
+								,
+								EDGE_T *neighbour_offsets // formerly "O"
+								,
+								MTYPE *path_destinations // formerly "M"  <---- no, index of edge!!!
+								,
+								EDGE_T *path_offsets // formerly "N"
+								,
+								std::size_t num_edges // formerly "ESize"
+								,
+								std::size_t num_vertices // formerly "OSize"
+								,
+								tri_t *tris // vector to store triangles results
+								,
+								std::size_t tris_capacity // max capacity of triangles vector
+)
 {
-	auto const vertex_id = static_cast< VERTEX_T >( blockIdx.x * blockDim.x + threadIdx.x );
+	auto const vertex_id = static_cast<VERTEX_T>(blockIdx.x * blockDim.x + threadIdx.x);
 
-	if( vertex_id < num_vertices )
+	if (vertex_id < num_vertices)
 	{
 		// If output is over-capacity already, sol'n is likely incorrect anyway! So, this condition
 		// has been eliminated, even if it could save some unnecessary work.
@@ -295,22 +330,14 @@ void cu_cliques_tris( VERTEX_T  * edge_destinations // formerly "E"
 		// been moved to after snapshotting a thread-local write index in tris to fix the race condition.
 		// if( d_global_num_triangles < tris_capacity );
 
-		auto const [ first_neighbour, last_neighbour ] = get_range_from_offsets( vertex_id
-																			   , neighbour_offsets
-                                                                               , num_vertices
-                                                                               , num_edges );
+		auto const [first_neighbour, last_neighbour] = get_range_from_offsets(vertex_id, neighbour_offsets, num_vertices, num_edges);
 
-        // iterate edges originating from vertex_id!!!
-		for( auto neighbour = first_neighbour; neighbour < last_neighbour; ++neighbour )
+		// iterate edges originating from vertex_id!!!
+		for (auto neighbour = first_neighbour; neighbour < last_neighbour; ++neighbour)
 		{
-			intersect_lists( edge_destinations + first_neighbour
-						   , edge_destinations + last_neighbour
-						   , path_destinations + path_offsets[ neighbour ]
-						   , path_destinations + path_offsets[ neighbour + 1 ] // no boundary case here like before??
-						   , edge_destinations
-						   , tri_t{ first_neighbour, neighbour, 0 /* overwritten with common neighbours */ }
-						   , tris
-						   , tris_capacity );
+			intersect_lists(edge_destinations + first_neighbour, edge_destinations + last_neighbour, path_destinations + path_offsets[neighbour], path_destinations + path_offsets[neighbour + 1] // no boundary case here like before??
+							,
+							edge_destinations, tri_t{first_neighbour, neighbour, 0 /* overwritten with common neighbours */}, tris, tris_capacity);
 		} // end of for-loop
 	}
 }
@@ -326,56 +353,40 @@ void cu_cliques_tris( VERTEX_T  * edge_destinations // formerly "E"
  * cliques_tri_par in cliques.hpp: the graph is split by split_parts and
  * each segment runs on a different GPU; results are gathered on the host.
  */
-__global__
-void cu_cliques_tris_seg( VERTEX_T  * edge_destinations
-                        , EDGE_T    * neighbour_offsets
-                        , MTYPE     * path_destinations
-                        , EDGE_T    * path_offsets       // size: (dst_ed - dst_bg + 1)
-                        , std::size_t num_edges
-                        , std::size_t num_vertices
-                        , std::size_t vertex_bg
-                        , std::size_t vertex_ed
-                        , std::size_t dst_bg             // = neighbour_offsets[vertex_bg]
-                        , tri_t     * tris
-                        , std::size_t tris_capacity )
+__global__ void cu_cliques_tris_seg(VERTEX_T *edge_destinations, EDGE_T *neighbour_offsets, MTYPE *path_destinations, EDGE_T *path_offsets // size: (dst_ed - dst_bg + 1)
+									,
+									std::size_t num_edges, std::size_t num_vertices, std::size_t vertex_bg, std::size_t vertex_ed, std::size_t dst_bg // = neighbour_offsets[vertex_bg]
+									,
+									tri_t *tris, std::size_t tris_capacity)
 {
-	auto const tid = static_cast< std::size_t >( blockIdx.x * blockDim.x + threadIdx.x );
-	auto const vertex_id = static_cast< VERTEX_T >( vertex_bg + tid );
+	auto const tid = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
+	auto const vertex_id = static_cast<VERTEX_T>(vertex_bg + tid);
 
-	if( vertex_id < vertex_ed )
+	if (vertex_id < vertex_ed)
 	{
-		auto const [ first_neighbour, last_neighbour ] = get_range_from_offsets( vertex_id
-		                                                                       , neighbour_offsets
-		                                                                       , num_vertices
-		                                                                       , num_edges );
+		auto const [first_neighbour, last_neighbour] = get_range_from_offsets(vertex_id, neighbour_offsets, num_vertices, num_edges);
 
-		for( auto neighbour = first_neighbour; neighbour < last_neighbour; ++neighbour )
+		for (auto neighbour = first_neighbour; neighbour < last_neighbour; ++neighbour)
 		{
 			auto const local_n = neighbour - dst_bg;
-			intersect_lists( edge_destinations + first_neighbour
-			               , edge_destinations + last_neighbour
-			               , path_destinations + path_offsets[ local_n ]
-			               , path_destinations + path_offsets[ local_n + 1 ]
-			               , edge_destinations
-			               , tri_t{ first_neighbour, neighbour, 0 }
-			               , tris
-			               , tris_capacity );
+			intersect_lists(edge_destinations + first_neighbour, edge_destinations + last_neighbour, path_destinations + path_offsets[local_n], path_destinations + path_offsets[local_n + 1], edge_destinations, tri_t{first_neighbour, neighbour, 0}, tris, tris_capacity);
 		}
 	}
 }
 
-__global__
-void cu_take_quds(
-		VERTEX_T* D,
-		EDGE_T* O,
-		tri_t* tris,
-		unsigned tris_sz,
-		VERTEX_T* DE_b,
-		VERTEX_T* DE_c,
-		EDGE_T* OE_b,
-		EDGE_T* OE_c) {
+__global__ void cu_take_quds(
+	VERTEX_T *D,
+	EDGE_T *O,
+	tri_t *tris,
+	unsigned tris_sz,
+	VERTEX_T *DE_b,
+	VERTEX_T *DE_c,
+	EDGE_T *OE_b,
+	EDGE_T *OE_c)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < tris_sz) {
+	if (i < tris_sz)
+	{
 		DE_b[i] = D[tris[i].b];
 		OE_b[i] = O[tris[i].b];
 		DE_c[i] = D[tris[i].c];
@@ -383,209 +394,220 @@ void cu_take_quds(
 	}
 }
 
-namespace create_paths {
-
-/**
- * Populates an array of offsets given a list of sizes
- * 
- * @pre The first element of path_endpoint_offsets must be zero
- * @pre path_endpoint_offsets must be allocated more spaced than none-zero elements in edge_endpoint_degrees
- * path_endpoint_offsets must have a length of at least |non-zero elments of edge_endpoint_degrees.size()| + 1
- */
-__host__
-void populate_path_offsets( thrust::device_vector<VERTEX_T> const& edge_endpoint_degrees
-                          , thrust::device_vector<EDGE_T>        & path_endpoint_offsets )
+namespace create_paths
 {
-	// using thrust materizlize a vector that only has none-zero elements of  edge_endpoint_degrees and then run an inclusive scan to populate path_endpoint_offsets
-    thrust::inclusive_scan( edge_endpoint_degrees.cbegin()
-                          , edge_endpoint_degrees.cend()
-                          , path_endpoint_offsets.begin() + 1u
-                          , thrust::plus<EDGE_T>() );
-}
 
-
-__global__
-void set_negated_first_instances( VERTEX_T const* edge_endpoint_degrees
-								, EDGE_T   const* path_offsets
-                                , EDGE_T   const* edge_endpoint_offsets
-                                , INDEX_T       * path_final_edges
-                                , std::size_t     num_edges )
-{
-    auto const edge = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if ( edge >= num_edges )
+	/**
+	 * Populates an array of offsets given a list of sizes
+	 *
+	 * @pre The first element of path_endpoint_offsets must be zero
+	 * @pre path_endpoint_offsets must be allocated more spaced than none-zero elements in edge_endpoint_degrees
+	 * path_endpoint_offsets must have a length of at least |non-zero elments of edge_endpoint_degrees.size()| + 1
+	 */
+	__host__ void populate_path_offsets(thrust::device_vector<VERTEX_T> const &edge_endpoint_degrees, thrust::device_vector<EDGE_T> &path_endpoint_offsets)
 	{
-		return;
+		// using thrust materizlize a vector that only has none-zero elements of  edge_endpoint_degrees and then run an inclusive scan to populate path_endpoint_offsets
+		thrust::inclusive_scan(edge_endpoint_degrees.cbegin(), edge_endpoint_degrees.cend(), path_endpoint_offsets.begin() + 1u, thrust::plus<EDGE_T>());
 	}
 
-	if (edge == 0)
+	__global__ void set_negated_first_instances(VERTEX_T const *edge_endpoint_degrees, EDGE_T const *path_offsets, EDGE_T const *edge_endpoint_offsets, INDEX_T *path_final_edges, std::size_t num_edges)
 	{
-		path_final_edges[ path_offsets[ edge ] ] = edge_endpoint_offsets[ edge ]; // + 1 - 0, but that plus one is not needed because there is no previous edge
-		return;
+		auto const edge = blockIdx.x * blockDim.x + threadIdx.x;
+
+		if (edge >= num_edges)
+		{
+			return;
+		}
+
+		if (edge == 0)
+		{
+			path_final_edges[path_offsets[edge]] = edge_endpoint_offsets[edge]; // + 1 - 0, but that plus one is not needed because there is no previous edge
+			return;
+		}
+
+		INDEX_T result_from_previous_edge = edge_endpoint_offsets[edge - 1] + edge_endpoint_degrees[edge - 1];
+		path_final_edges[path_offsets[edge]] = edge_endpoint_offsets[edge] + 1 - result_from_previous_edge;
+		// WHY THE PLUS ONE???
 	}
 
-	INDEX_T result_from_previous_edge = edge_endpoint_offsets[ edge - 1 ] + edge_endpoint_degrees[ edge - 1 ];
-	path_final_edges[ path_offsets[ edge ] ] = edge_endpoint_offsets[ edge ] + 1 - result_from_previous_edge;
-	// WHY THE PLUS ONE???
+	/**
+	 * Completes every path by writing the index of the second edge in the path into path_final_edges
+	 */
+	__host__ void extend_edges_to_paths(thrust::device_vector<VERTEX_T> const &edge_endpoint_degrees, thrust::device_vector<EDGE_T> const &edge_endpoint_offsets, thrust::device_vector<EDGE_T> const &path_offsets, thrust::device_vector<MTYPE> &path_second_edges)
+	{
+		// Algorithm goes in three steps:
+		// a) set all values to 1 (or throw error if over-capacity)
+		// b) set the first instance of each subsequence to its correct initial value less
+		//    the previous subsequences correct initial value
+		// c) run an inclusive scan
+		// That last step will create an increasing sequence for each subsequence
+		// because the inclusive scan is run over an array initialised with 1's.
+		// Because the edges emanating from each original vertex are contiguous,
+		// the increasing sequence corresponds exactly to the sorted list of all
+		// edge id's starting from this seed edge's endpoint.
+
+		auto const num_edges = edge_endpoint_degrees.size(); // must be nnz, not path_offsets.size()
+		auto const num_blocks = dim3(blocks(num_edges), 1, 1);
+
+		if (num_edges > path_second_edges.capacity())
+		{
+			throw std::runtime_error("Can't fit data to path_second_edges.");
+		}
+
+		// Caller pre-allocates path_second_edges with the exact size (total path
+		// count) and pre-fills it with 1. Skipping the resize+reduce avoids an
+		// O(|paths|) pass per call (significant on large graphs).
+
+		set_negated_first_instances<<<num_blocks, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(edge_endpoint_degrees.data()), thrust::raw_pointer_cast(path_offsets.data()), thrust::raw_pointer_cast(edge_endpoint_offsets.data()), thrust::raw_pointer_cast(path_second_edges.data()), num_edges);
+
+		thrust::inclusive_scan(path_second_edges.cbegin(), path_second_edges.cend(), path_second_edges.begin(), thrust::plus<MTYPE>());
+	}
+
 }
 
 /**
- * Completes every path by writing the index of the second edge in the path into path_final_edges
+ * GPU equivalent of utility::take: dst = vec[idx] using thrust::gather.
+ * Resizes dst to idx.size().
  */
-__host__
-void extend_edges_to_paths( thrust::device_vector<VERTEX_T> const& edge_endpoint_degrees
-                          , thrust::device_vector<EDGE_T>   const& edge_endpoint_offsets
-                          , thrust::device_vector<EDGE_T>   const& path_offsets
-                          , thrust::device_vector<MTYPE>         & path_second_edges
-                          )
+template <typename T, typename U>
+__host__ void cu_take(thrust::device_vector<T> const &vec,
+					  thrust::device_vector<U> const &idx,
+					  thrust::device_vector<T> &dst)
 {
-    // Algorithm goes in three steps:
-    // a) set all values to 1 (or throw error if over-capacity)
-    // b) set the first instance of each subsequence to its correct initial value less
-    //    the previous subsequences correct initial value
-    // c) run an inclusive scan
-    // That last step will create an increasing sequence for each subsequence
-    // because the inclusive scan is run over an array initialised with 1's.
-    // Because the edges emanating from each original vertex are contiguous,
-    // the increasing sequence corresponds exactly to the sorted list of all
-    // edge id's starting from this seed edge's endpoint. 
-
-    auto const num_edges = edge_endpoint_degrees.size(); // must be nnz, not path_offsets.size()
-    auto const num_blocks = dim3( blocks( num_edges ), 1, 1 );
-
-    if( num_edges > path_second_edges.capacity() )
-    {
-        throw std::runtime_error("Can't fit data to path_second_edges.");
-    }
-
-    path_second_edges.resize( thrust::reduce( edge_endpoint_degrees.cbegin()
-											, edge_endpoint_degrees.cend()
-											, 0 )
-							, 1);
-
-
-    set_negated_first_instances<<<num_blocks, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( edge_endpoint_degrees.data() )
-															 , thrust::raw_pointer_cast( path_offsets.data() )
-                                                             , thrust::raw_pointer_cast( edge_endpoint_offsets.data() )
-                                                             , thrust::raw_pointer_cast( path_second_edges.data() )
-                                                             , num_edges );
-
-    thrust::inclusive_scan( path_second_edges.cbegin()
-                          , path_second_edges.cend()
-                          , path_second_edges.begin()
-                          , thrust::plus<MTYPE>() );
+	dst.resize(idx.size());
+	thrust::gather(idx.cbegin(), idx.cend(), vec.cbegin(), dst.begin());
 }
 
+/**
+ * Alternative GPU take: dst = vec[idx] via thrust::transform on a raw
+ * pointer (the pattern we used before introducing cu_take). Kept as a
+ * second implementation so we can benchmark gather vs transform.
+ */
+template <typename T, typename U>
+__host__ void cu_take_tr(thrust::device_vector<T> const &vec,
+						 thrust::device_vector<U> const &idx,
+						 thrust::device_vector<T> &dst)
+{
+	dst.resize(idx.size());
+	auto vec_ptr = thrust::raw_pointer_cast(vec.data());
+	thrust::transform(idx.cbegin(), idx.cend(), dst.begin(),
+					  [vec_ptr] __device__(U i)
+					  { return vec_ptr[i]; });
 }
 
 /**
  * Materialises all length-two paths as a CSR graph by indexing edges to lists of paths.
  * The input is two maps from edge->endpoint degree and edge->endpoint offset. This is
  * expanded to an output of edge->paths offset and path->index of second edge.
- * 
+ *
  * The operation itself takes an input of counts like [2, 0, 3, 1] and starting indexes
  * like [2, 4, 1, 0] and produces an expanded sequence in which each start index is
  * expanded to an incrementing sequence of length indicated by the corresponding index
  * of the count array. In this example, the result would be: [2, 3, 1, 2, 3, 0]
  * with offsets set to the prefix sum of the counts, i.e., [0, 2, 2, 5, 6] that indicate
- * the index at which paths starting from the i'th edge begin. 
- * 
+ * the index at which paths starting from the i'th edge begin.
+ *
  * @param edge_endpoint_degrees Degree of vertex v for each edge (u,v). Formerly DE.
  * @param edge_endpoint_offsets Offset to start of neighbours of v for each edge (u,v). Formerly OE.
  * @param path_offsets Offset to start of neighbours w for paths (u,v,w). Formerly N.
  * @param path_second_edges Index second edge in length-two paths. Formerly M.
- */ 
-__host__
-void cu_multi_arrange( thrust::device_vector<VERTEX_T> const& edge_endpoint_degrees
-		             , thrust::device_vector<EDGE_T>   const& edge_endpoint_offsets
-                     , thrust::device_vector<EDGE_T>        & path_offsets
-		             , thrust::device_vector<MTYPE>         & path_second_edges
-		             )
+ */
+__host__ void cu_multi_arrange(thrust::device_vector<VERTEX_T> const &edge_endpoint_degrees, thrust::device_vector<EDGE_T> const &edge_endpoint_offsets, thrust::device_vector<EDGE_T> &path_offsets, thrust::device_vector<MTYPE> &path_second_edges)
 {
-    using namespace create_paths;
+	using namespace create_paths;
 
 	// 1. Count non-zero elements directly
 	auto nnz = thrust::count_if(edge_endpoint_degrees.cbegin(),
 								edge_endpoint_degrees.cend(),
-								[] __device__ (VERTEX_T v) { return v != 0; });
+								[] __device__(VERTEX_T v)
+								{ return v != 0; });
 
 	// 2. Copy non-zero elements using edge_endpoint_degrees as stencil
 	thrust::device_vector<VERTEX_T> compacted_degrees(nnz);
 	thrust::copy_if(edge_endpoint_degrees.cbegin(),
 					edge_endpoint_degrees.cend(),
-					edge_endpoint_degrees.cbegin(),  // stencil
+					edge_endpoint_degrees.cbegin(), // stencil
 					compacted_degrees.begin(),
-					[] __device__ (VERTEX_T v) { return v != 0; });
+					[] __device__(VERTEX_T v)
+					{ return v != 0; });
 
 	// 3. Copy corresponding offsets using the same stencil
 	thrust::device_vector<EDGE_T> compacted_offsets(nnz);
 	thrust::copy_if(edge_endpoint_offsets.cbegin(),
 					edge_endpoint_offsets.cend(),
-					edge_endpoint_degrees.cbegin(),  // stencil
+					edge_endpoint_degrees.cbegin(), // stencil
 					compacted_offsets.begin(),
-					[] __device__ (VERTEX_T v) { return v != 0; });
-
+					[] __device__(VERTEX_T v)
+					{ return v != 0; });
 
 	path_offsets.resize(edge_endpoint_degrees.size() + 1); //  +1 for first element to be zero
-    populate_path_offsets( edge_endpoint_degrees, path_offsets );
-	thrust::device_vector<EDGE_T> compacted_path_offsets(nnz); // no need to +1 here as last element will be ignored
-    populate_path_offsets( compacted_degrees, compacted_path_offsets );
-    extend_edges_to_paths( compacted_degrees, compacted_offsets, compacted_path_offsets, path_second_edges );
+	populate_path_offsets(edge_endpoint_degrees, path_offsets);
+	thrust::device_vector<EDGE_T> compacted_path_offsets(nnz + 1); // +1 for writes starting at begin()+1
+	populate_path_offsets(compacted_degrees, compacted_path_offsets);
+	extend_edges_to_paths(compacted_degrees, compacted_offsets, compacted_path_offsets, path_second_edges);
 }
 
-
-
-__global__
-void cu_cliques_quds(tri_t* tris, // we use tris struct instead of E vector
-					 EDGE_T* O,
-					 MTYPE* M0,
-					 EDGE_T* N0,
-					 MTYPE* M1,
-					 EDGE_T* N1,
-					 size_t trisSize, // size of E vector
-					 size_t OSize, // Size of O vector
-					 qud_t* quds, // vector to store four clique results
-					 size_t qudsSize // four cliques vector size
-) {
+__global__ void cu_cliques_quds(tri_t *tris, // we use tris struct instead of E vector
+								EDGE_T *O,
+								MTYPE *M0,
+								EDGE_T *N0,
+								MTYPE *M1,
+								EDGE_T *N1,
+								size_t trisSize, // size of E vector
+								size_t OSize,	 // Size of O vector
+								qud_t *quds,	 // vector to store four clique results
+								size_t qudsSize	 // four cliques vector size
+)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-	if(i < OSize && d_global_num_4cliques < qudsSize) {
+	if (i < OSize && d_global_num_4cliques < qudsSize)
+	{
 		EDGE_T d1 = O[i];
 		EDGE_T d2 = trisSize;
-		if (i < OSize-1) {
-			d2 = O[i+1];
+		if (i < OSize - 1)
+		{
+			d2 = O[i + 1];
 		}
 		// loop E[d1:d2]
-		for(auto d = d1; d < d2; d++) {
+		for (auto d = d1; d < d2; d++)
+		{
 			auto i1 = d1;
 			auto j1 = N0[d];
-			const auto& j2 = N0[d+1];
+			const auto &j2 = N0[d + 1];
 
 			// loop EM[j1:j2]
 			// intersection(E[d1..d..d2], EM[N[d]..j1..N[d+1])
 			// find indices of intersection
-			while(i1 < d2 && j1 < j2) {
-				const auto& p = tris[i1].b; //E[i1][0];
-				const auto& o1 = static_cast<EDGE_T>(M0[j1]);
-				const auto& q = tris[o1].b; //E[o1][0];
-				if(p < q) {
+			while (i1 < d2 && j1 < j2)
+			{
+				const auto &p = tris[i1].b; // E[i1][0];
+				const auto &o1 = static_cast<EDGE_T>(M0[j1]);
+				const auto &q = tris[o1].b; // E[o1][0];
+				if (p < q)
+				{
 					i1++;
-				} else {
-					if(!(q < p)) {
-						auto& k1 = N1[i1];
-						auto& k2 = N1[i1+1];
+				}
+				else
+				{
+					if (!(q < p))
+					{
+						auto &k1 = N1[i1];
+						auto &k2 = N1[i1 + 1];
 						auto k = k1;
-						for (; k < k2; k++) {
-							const auto& o2 = static_cast<EDGE_T>(M1[k]);
-							//if(E[d][1] == E[o2][1]) {
-							if(tris[d].c == tris[o2].c) {
-									auto id = atomicAdd(&d_global_num_4cliques, 1ul);
-									quds[id].a = i1;
-									quds[id].b = o1;
-									quds[id].c = d;
-									quds[id].d = o2;
-									i1++;
-									break;
+						for (; k < k2; k++)
+						{
+							const auto &o2 = static_cast<EDGE_T>(M1[k]);
+							// if(E[d][1] == E[o2][1]) {
+							if (tris[d].c == tris[o2].c)
+							{
+								auto id = warp_aggregated_add(&d_global_num_4cliques);
+								quds[id].a = i1;
+								quds[id].b = o1;
+								quds[id].c = d;
+								quds[id].d = o2;
+								i1++;
+								break;
 							}
 						}
 					}
@@ -603,19 +625,20 @@ void cu_cliques_quds(tri_t* tris, // we use tris struct instead of E vector
  * [seg_bg, seg_bg + seg_size). Output arrays are sized seg_size and indexed by
  * (global_triangle - seg_bg).
  */
-__global__
-void cu_take_quds_seg(
-		VERTEX_T* trisD,           // triangle-graph degrees (global, size num_triangles)
-		EDGE_T* trisO,             // triangle-graph offsets (global, size num_triangles)
-		tri_t* tris,               // triangle list (global, size num_triangles)
-		std::size_t seg_bg,        // first triangle index in this segment
-		std::size_t seg_size,      // number of triangles in this segment
-		VERTEX_T* DE_b,
-		VERTEX_T* DE_c,
-		EDGE_T* OE_b,
-		EDGE_T* OE_c) {
+__global__ void cu_take_quds_seg(
+	VERTEX_T *trisD,	  // triangle-graph degrees (global, size num_triangles)
+	EDGE_T *trisO,		  // triangle-graph offsets (global, size num_triangles)
+	tri_t *tris,		  // triangle list (global, size num_triangles)
+	std::size_t seg_bg,	  // first triangle index in this segment
+	std::size_t seg_size, // number of triangles in this segment
+	VERTEX_T *DE_b,
+	VERTEX_T *DE_c,
+	EDGE_T *OE_b,
+	EDGE_T *OE_c)
+{
 	auto const tid = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
-	if(tid < seg_size) {
+	if (tid < seg_size)
+	{
 		auto const i = seg_bg + tid;
 		DE_b[tid] = trisD[tris[i].b];
 		OE_b[tid] = trisO[tris[i].b];
@@ -636,55 +659,64 @@ void cu_take_quds_seg(
  * dereferences arbitrary triangle ids (o1 = M0[j1], o2 = M1[k]) that can
  * point anywhere in the global triangle list.
  */
-__global__
-void cu_cliques_quds_seg(tri_t* tris,
-                         EDGE_T* trisO,
-                         MTYPE* M0,
-                         EDGE_T* N0,              // size: (dst_ed - dst_bg + 1)
-                         MTYPE* M1,
-                         EDGE_T* N1,              // size: (dst_ed - dst_bg + 1)
-                         std::size_t num_triangles,   // size of tris[] (== tgraph.size_edges())
-                         std::size_t num_tverts,      // size of trisO[] (== tgraph.size_vertices())
-                         std::size_t vertex_bg,
-                         std::size_t vertex_ed,
-                         std::size_t dst_bg,      // = trisO[vertex_bg]
-                         qud_t* quds,
-                         std::size_t qudsSize) {
+__global__ void cu_cliques_quds_seg(tri_t *tris,
+									EDGE_T *trisO,
+									MTYPE *M0,
+									EDGE_T *N0, // size: (dst_ed - dst_bg + 1)
+									MTYPE *M1,
+									EDGE_T *N1,				   // size: (dst_ed - dst_bg + 1)
+									std::size_t num_triangles, // size of tris[] (== tgraph.size_edges())
+									std::size_t num_tverts,	   // size of trisO[] (== tgraph.size_vertices())
+									std::size_t vertex_bg,
+									std::size_t vertex_ed,
+									std::size_t dst_bg, // = trisO[vertex_bg]
+									qud_t *quds,
+									std::size_t qudsSize)
+{
 	auto const tid = static_cast<std::size_t>(blockIdx.x * blockDim.x + threadIdx.x);
 	auto const i = vertex_bg + tid;
 
-	if(i < vertex_ed && d_global_num_4cliques < qudsSize) {
+	if (i < vertex_ed && d_global_num_4cliques < qudsSize)
+	{
 		EDGE_T d1 = trisO[i];
 		EDGE_T d2 = (i + 1 < num_tverts) ? trisO[i + 1] : static_cast<EDGE_T>(num_triangles);
 		// loop tris[d1:d2]
-		for(auto d = d1; d < d2; d++) {
+		for (auto d = d1; d < d2; d++)
+		{
 			auto i1 = d1;
 			auto const local_d = static_cast<std::size_t>(d) - dst_bg;
 			auto j1 = N0[local_d];
-			const auto& j2 = N0[local_d + 1];
+			const auto &j2 = N0[local_d + 1];
 
-			while(i1 < d2 && j1 < j2) {
-				const auto& p = tris[i1].b;
-				const auto& o1 = static_cast<EDGE_T>(M0[j1]);
-				const auto& q = tris[o1].b;
-				if(p < q) {
+			while (i1 < d2 && j1 < j2)
+			{
+				const auto &p = tris[i1].b;
+				const auto &o1 = static_cast<EDGE_T>(M0[j1]);
+				const auto &q = tris[o1].b;
+				if (p < q)
+				{
 					i1++;
-				} else {
-					if(!(q < p)) {
+				}
+				else
+				{
+					if (!(q < p))
+					{
 						auto const local_i1 = static_cast<std::size_t>(i1) - dst_bg;
-						auto& k1 = N1[local_i1];
-						auto& k2 = N1[local_i1 + 1];
+						auto &k1 = N1[local_i1];
+						auto &k2 = N1[local_i1 + 1];
 						auto k = k1;
-						for (; k < k2; k++) {
-							const auto& o2 = static_cast<EDGE_T>(M1[k]);
-							if(tris[d].c == tris[o2].c) {
-									auto id = atomicAdd(&d_global_num_4cliques, 1ul);
-									quds[id].a = i1;
-									quds[id].b = o1;
-									quds[id].c = d;
-									quds[id].d = o2;
-									i1++;
-									break;
+						for (; k < k2; k++)
+						{
+							const auto &o2 = static_cast<EDGE_T>(M1[k]);
+							if (tris[d].c == tris[o2].c)
+							{
+								auto id = warp_aggregated_add(&d_global_num_4cliques);
+								quds[id].a = i1;
+								quds[id].b = o1;
+								quds[id].c = d;
+								quds[id].d = o2;
+								i1++;
+								break;
 							}
 						}
 					}
@@ -695,148 +727,149 @@ void cu_cliques_quds_seg(tri_t* tris,
 	}
 }
 
-
 /**
- * Make quds undirected by adding quds three 
+ * Make quds undirected by adding quds three
  * other permutation to the quds vector then
  * we do the sorting
-*/
-__global__
-void cu_quds_to_ugraph(qud_t* quds,
-					   size_t qudsSize) {
+ */
+__global__ void cu_quds_to_ugraph(qud_t *quds,
+								  size_t qudsSize)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < qudsSize) {
-		const auto& qud = quds[i];
+	if (i < qudsSize)
+	{
+		const auto &qud = quds[i];
 
-		quds[i+qudsSize].a = qud.b;
-		quds[i+qudsSize].b = qud.c;
-		quds[i+qudsSize].c = qud.d;
-		quds[i+qudsSize].d = qud.a;
+		quds[i + qudsSize].a = qud.b;
+		quds[i + qudsSize].b = qud.c;
+		quds[i + qudsSize].c = qud.d;
+		quds[i + qudsSize].d = qud.a;
 
-		quds[i+(2*qudsSize)].a = qud.c;
-		quds[i+(2*qudsSize)].b = qud.d;
-		quds[i+(2*qudsSize)].c = qud.a;
-		quds[i+(2*qudsSize)].d = qud.b;
-	
-		quds[i+(3*qudsSize)].a = qud.d;
-		quds[i+(3*qudsSize)].b = qud.a;
-		quds[i+(3*qudsSize)].c = qud.b;
-		quds[i+(3*qudsSize)].d = qud.c;
+		quds[i + (2 * qudsSize)].a = qud.c;
+		quds[i + (2 * qudsSize)].b = qud.d;
+		quds[i + (2 * qudsSize)].c = qud.a;
+		quds[i + (2 * qudsSize)].d = qud.b;
+
+		quds[i + (3 * qudsSize)].a = qud.d;
+		quds[i + (3 * qudsSize)].b = qud.a;
+		quds[i + (3 * qudsSize)].c = qud.b;
+		quds[i + (3 * qudsSize)].d = qud.c;
 	}
 }
 
 /**
- * Make quds undirected by adding quds three 
+ * Make quds undirected by adding quds three
  * other permutation to the quds vector then
  * we do the sorting
-*/
-__global__
-void cu_quds_to_ugraph2(qud_t* quds,
-						dbl_t* dbls,
-					   size_t qudsSize) {
+ */
+__global__ void cu_quds_to_ugraph2(qud_t *quds,
+								   dbl_t *dbls,
+								   size_t qudsSize)
+{
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if(i < qudsSize) {
-		const auto& qud = quds[i];
+	if (i < qudsSize)
+	{
+		const auto &qud = quds[i];
 
-		//a, 
+		// a,
 		dbls[i].a = qud.a;
 		dbls[i].b = qud.b;
 
-		dbls[i+qudsSize].a = qud.a;
-		dbls[i+qudsSize].b = qud.c;
+		dbls[i + qudsSize].a = qud.a;
+		dbls[i + qudsSize].b = qud.c;
 
-		dbls[i+(2*qudsSize)].a = qud.a;
-		dbls[i+(2*qudsSize)].b = qud.d;
+		dbls[i + (2 * qudsSize)].a = qud.a;
+		dbls[i + (2 * qudsSize)].b = qud.d;
 
-		//b, 
-		dbls[i+(3*qudsSize)].a = qud.b;
-		dbls[i+(3*qudsSize)].b = qud.a;
-		
-		dbls[i+(4*qudsSize)].a = qud.b;
-		dbls[i+(4*qudsSize)].b = qud.c;
-		
-		dbls[i+(5*qudsSize)].a = qud.b;
-		dbls[i+(5*qudsSize)].b = qud.d;
+		// b,
+		dbls[i + (3 * qudsSize)].a = qud.b;
+		dbls[i + (3 * qudsSize)].b = qud.a;
 
-		//c,
-		dbls[i+(6*qudsSize)].a = qud.c;
-		dbls[i+(6*qudsSize)].b = qud.a;
-		
-		dbls[i+(7*qudsSize)].a = qud.c;
-		dbls[i+(7*qudsSize)].b = qud.b;
-		
-		dbls[i+(8*qudsSize)].a = qud.c;
-		dbls[i+(8*qudsSize)].b = qud.d;
+		dbls[i + (4 * qudsSize)].a = qud.b;
+		dbls[i + (4 * qudsSize)].b = qud.c;
 
-		//d,
-		dbls[i+(9*qudsSize)].a = qud.d;
-		dbls[i+(9*qudsSize)].b = qud.a;
-		
-		dbls[i+(10*qudsSize)].a = qud.d;
-		dbls[i+(10*qudsSize)].b = qud.b;
-		
-		dbls[i+(11*qudsSize)].a = qud.d;
-		dbls[i+(11*qudsSize)].b = qud.c;
+		dbls[i + (5 * qudsSize)].a = qud.b;
+		dbls[i + (5 * qudsSize)].b = qud.d;
+
+		// c,
+		dbls[i + (6 * qudsSize)].a = qud.c;
+		dbls[i + (6 * qudsSize)].b = qud.a;
+
+		dbls[i + (7 * qudsSize)].a = qud.c;
+		dbls[i + (7 * qudsSize)].b = qud.b;
+
+		dbls[i + (8 * qudsSize)].a = qud.c;
+		dbls[i + (8 * qudsSize)].b = qud.d;
+
+		// d,
+		dbls[i + (9 * qudsSize)].a = qud.d;
+		dbls[i + (9 * qudsSize)].b = qud.a;
+
+		dbls[i + (10 * qudsSize)].a = qud.d;
+		dbls[i + (10 * qudsSize)].b = qud.b;
+
+		dbls[i + (11 * qudsSize)].a = qud.d;
+		dbls[i + (11 * qudsSize)].b = qud.c;
 	}
 }
 
-namespace wipeout {
-	
-	__global__
-	void cu_initialize() {
+namespace wipeout
+{
+
+	__global__ void cu_initialize()
+	{
 		d_2peel_current = 1U;
 		d_2peel_next = -1U;
 	}
 
-	__global__
-	void cu_next_value_to_peel(
-				const MTYPE* V,
-				const VERTEX_T* D,
-				size_t sz) {
-		
+	__global__ void cu_next_value_to_peel(
+		const MTYPE *V,
+		const VERTEX_T *D,
+		size_t sz)
+	{
+
 		int i = blockIdx.x * blockDim.x + threadIdx.x;
-		if(i < sz && V[i] == -1) {
+		if (i < sz && V[i] == -1)
+		{
 			atomicMin(&d_2peel_next, D[i]);
 		}
 	}
 
-	__global__
-	void cu_update_value_to_peel() {
+	__global__ void cu_update_value_to_peel()
+	{
 		atomicMax(&d_2peel_current, d_2peel_next);
 		d_2peel_next = -1U;
 	}
 
-	__global__
-	void cu_peeling_kcore(const VERTEX_T* E,
-					MTYPE* V,
-					const VERTEX_T* D,
-					VERTEX_T* DD,
-					const VERTEX_T* O,
-					size_t sz) {
+	__global__ void cu_peeling_kcore(const VERTEX_T *E,
+									 MTYPE *V,
+									 const VERTEX_T *D,
+									 VERTEX_T *DD,
+									 const VERTEX_T *O,
+									 size_t sz)
+	{
 
 		int i = blockIdx.x * blockDim.x + threadIdx.x;
-		if(i < sz && V[i]==-1 && DD[i]<=d_2peel_current) {
-				atomicExch_system(&V[i], d_2peel_current);
-				const auto& deg = D[i];
-				const auto& off = O[i];
+		if (i < sz && V[i] == -1 && DD[i] <= d_2peel_current)
+		{
+			atomicExch_system(&V[i], d_2peel_current);
+			const auto &deg = D[i];
+			const auto &off = O[i];
 
-				for(size_t d = 0; d < deg; d++) {
-					auto& j = E[off+d];
-					atomicSub_system(&DD[j], 1U);
-				} // neighbors loop
+			for (size_t d = 0; d < deg; d++)
+			{
+				auto &j = E[off + d];
+				atomicSub_system(&DD[j], 1U);
+			} // neighbors loop
 		}
 	}
 
-
-	__host__
-	unsigned int run(const std::vector<VERTEX_T>& D,
-		const std::vector<EDGE_T>& O,
-		const std::vector<VERTEX_T>& E,
-		std::vector<MTYPE>& kv,
-		std::map<std::string, milliseconds>& tms) {
-		
-		std::cout << "=========================================" << std::endl;
-		std::cout << "CUDA allocating memory ... " << std::endl;
+	__host__ unsigned int run(const std::vector<VERTEX_T> &D,
+							  const std::vector<EDGE_T> &O,
+							  const std::vector<VERTEX_T> &E,
+							  std::vector<MTYPE> &kv,
+							  std::unordered_map<std::string, seconds> &tms)
+	{
 
 		auto nV = D.size();
 		thrust::device_vector<VERTEX_T> d_D(D);
@@ -844,12 +877,8 @@ namespace wipeout {
 		thrust::device_vector<EDGE_T> d_O(O);
 		thrust::device_vector<VERTEX_T> d_E(E);
 		thrust::device_vector<MTYPE> d_kv(nV, -1);
-		dim3 nBlocks (blocks(nV), 1, 1);
-
-
-		std::cout << "=========================================" << std::endl;
-		std::cout << "CUDA constructing Bucket ..." << std::endl;
-
+		dim3 nBlocks(blocks(nV), 1, 1);
+		
 		auto t = hrc::now();
 
 		cu_initialize<<<1, 1>>>();
@@ -858,143 +887,138 @@ namespace wipeout {
 		thrust::replace_copy_if(
 			d_D.begin(),
 			d_D.end(),
-			d_kv.begin(), 
-			[] __device__(const auto& t){return t!=0;},
+			d_kv.begin(),
+			[] __device__(const auto &t)
+			{ return t != 0; },
 			-1);
 
-
-		CU_ERR( cudaPeekAtLastError() );
-		CU_ERR( cudaDeviceSynchronize() );
-		tms["constructing"] = hrc::now() - t;
-		std::cout << "CUDA constructing Bucket finished: "
-			<< tms["constructing"].count() << " ms" << std::endl;
-		
-		std::cout << "=========================================" << std::endl;
-		std::cout << "CUDA peeling Bucket ..." << std::endl;
-		auto nLoopCounter = 0U;
+		CU_ERR(cudaPeekAtLastError());
+		CU_ERR(cudaDeviceSynchronize());
+		tms["Pre peeling"] = hrc::now() - t;
 		unsigned next_peel = 0U;
 		t = hrc::now();
-		while(true) {
+		while (true)
+		{
 			cu_next_value_to_peel<<<nBlocks, MAX_THRD_BLK>>>(
 				thrust::raw_pointer_cast(d_kv.data()),
 				thrust::raw_pointer_cast(d_DD.data()),
 				d_kv.size());
 			cudaMemcpyFromSymbol(&next_peel,
-								d_2peel_next,
-								sizeof(d_2peel_next),
-								0,
-								cudaMemcpyDeviceToHost);
-			if(next_peel==-1U){
+								 d_2peel_next,
+								 sizeof(d_2peel_next),
+								 0,
+								 cudaMemcpyDeviceToHost);
+			if (next_peel == -1U)
+			{
 				break;
 			}
 
 			cu_update_value_to_peel<<<1, 1>>>();
-				
+
 			cu_peeling_kcore<<<nBlocks, MAX_THRD_BLK>>>(
-					thrust::raw_pointer_cast(d_E.data()),
-					thrust::raw_pointer_cast(d_kv.data()),
-					thrust::raw_pointer_cast(d_D.data()),
-					thrust::raw_pointer_cast(d_DD.data()),
-					thrust::raw_pointer_cast(d_O.data()),
-					d_D.size());
-			
-			nLoopCounter++;
+				thrust::raw_pointer_cast(d_E.data()),
+				thrust::raw_pointer_cast(d_kv.data()),
+				thrust::raw_pointer_cast(d_D.data()),
+				thrust::raw_pointer_cast(d_DD.data()),
+				thrust::raw_pointer_cast(d_O.data()),
+				d_D.size());
 
 		} // End of while loop
-		CU_ERR( cudaPeekAtLastError() );
-		CU_ERR( cudaDeviceSynchronize() ); // This is required
+		CU_ERR(cudaPeekAtLastError());
+		CU_ERR(cudaDeviceSynchronize()); // This is required
 		tms["peeling"] = hrc::now() - t;
-		std::cout << "CUDA peeling Bucket finished: "
-			<< tms["peeling"].count() << " ms" << std::endl;
-		std::cout << "Total Kernel launches: "
-			<< nLoopCounter	<< std::endl;
-		std::cout << "=========================================" << std::endl;
-		std::cout << "Transferring data back to CPU ..." << std::endl;
-
+		
+		// Transferring data back to CPU ...
 		unsigned k_max;
 		cudaMemcpyFromSymbol(&k_max,
-							d_2peel_current,
-							sizeof(d_2peel_current),
-							0,
-							cudaMemcpyDeviceToHost);
+							 d_2peel_current,
+							 sizeof(d_2peel_current),
+							 0,
+							 cudaMemcpyDeviceToHost);
 
 		kv.resize(d_kv.size());
 		thrust::copy(d_kv.cbegin(), d_kv.cend(), kv.begin());
-		tms["all"] = milliseconds::zero();
-		for(const auto& tm: tms) {
-			if(tm.first!="all") {
-				tms["all"] += tm.second;
-			}
+		seconds total = seconds::zero();
+		for (const auto &tm : tms)
+		{
+			total += tm.second;
 		}
+		tms["Total"] = total;
 		return k_max;
 	} // End of run()
 } // End of wipeout approach
 
-
-
-namespace cu {
-	__global__
-	void initialize(unsigned int startPeel=1U) {
+namespace cu
+{
+	__global__ void initialize(unsigned int startPeel = 1U)
+	{
 		d_2peel_current = 0U;
 		d_2peel_next = startPeel;
 		d_peeled = 0U;
 	}
 
-	__global__
-	void peel_zeros(
-				MTYPE* V,
-				const VERTEX_T* D,
-				size_t sz) {
+	__global__ void peel_zeros(
+		MTYPE *V,
+		const VERTEX_T *D,
+		size_t sz)
+	{
 		int i = blockIdx.x * blockDim.x + threadIdx.x;
-		if(i < sz && D[i] == 0) {
+		if (i < sz && D[i] == 0)
+		{
 			V[i] = 0;
-			atomicAdd(&d_peeled, 1);
+			warp_aggregated_add(&d_peeled);
 		}
 	}
 
-	__global__
-	void update_value_to_peel() {
+	__global__ void update_value_to_peel()
+	{
 		d_2peel_current = d_2peel_next;
-		//printf("cu peel %d\n", d_2peel_current);
+		// printf("cu peel %d\n", d_2peel_current);
 		d_2peel_next++;
 	}
-	
-	namespace kcore {
-		__global__
-		void peeling(const VERTEX_T* E,
-						MTYPE* V,
-						const VERTEX_T* D,
-						VERTEX_T* DD,
-						const VERTEX_T* O,
-						size_t sz) {
+
+	namespace kcore
+	{
+		__global__ void peeling(const VERTEX_T *E,
+								MTYPE *V,
+								const VERTEX_T *D,
+								VERTEX_T *DD,
+								const VERTEX_T *O,
+								size_t sz)
+		{
 
 			int i = blockIdx.x * blockDim.x + threadIdx.x;
-			if(i < sz && V[i]==-1 && DD[i] <= d_2peel_current) {
-				atomicExch_system(&V[i], d_2peel_current);
-				atomicAdd(&d_peeled, 1);
+			if (i < sz && V[i] == -1 && DD[i] <= d_2peel_current)
+			{
+				V[i] = d_2peel_current; // unique i per thread
+				warp_aggregated_add(&d_peeled);
 
-				const auto& deg = D[i];
-				const auto& off = O[i];
+				const auto &deg = D[i];
+				const auto &off = O[i];
 
-				for(size_t d = 0; d < deg; d++) {
-					auto& j = E[off+d];
+				for (size_t d = 0; d < deg; d++)
+				{
+					auto &j = E[off + d];
 					auto old = atomicSub_system(&DD[j], 1U);
-					if(old == d_2peel_current+1) {
+					// A neighbour whose degree drops to (or is already at/below)
+					// the current peel value must be re-processed in this same
+					// round. Using '==' missed neighbours already at/below the
+					// threshold, terminating the cascade early and inflating some
+					// vertices' k-core values.
+					if (old <= d_2peel_current + 1)
+					{
 						d_2peel_next = d_2peel_current;
 					}
 				} // neighbors loop
 			} // kernel block
 		} // cu_peeling_kcore(...)
 
-		__host__
-		unsigned int run(const std::vector<VERTEX_T>& D,
-			const std::vector<EDGE_T>& O,
-			const std::vector<VERTEX_T>& E,
-			std::vector<MTYPE>& kv,
-			std::map<std::string, milliseconds>& tms) {
-			
-			std::cout << "=========================================" << std::endl;
-			std::cout << "CUDA allocating memory ... " << std::endl;
+		__host__ unsigned int run(const std::vector<VERTEX_T> &D,
+								  const std::vector<EDGE_T> &O,
+								  const std::vector<VERTEX_T> &E,
+								  std::vector<MTYPE> &kv,
+								  std::unordered_map<std::string, seconds> &ts)
+		{
 
 			auto nV = D.size();
 			thrust::device_vector<VERTEX_T> d_D(D);
@@ -1002,120 +1026,108 @@ namespace cu {
 			thrust::device_vector<EDGE_T> d_O(O);
 			thrust::device_vector<VERTEX_T> d_E(E);
 			thrust::device_vector<MTYPE> d_kv(nV, -1);
-			dim3 nBlocks (blocks(nV), 1, 1);
-
-
-			std::cout << "=========================================" << std::endl;
-			std::cout << "CUDA constructing Bucket ..." << std::endl;
+			dim3 nBlocks(blocks(nV), 1, 1);
 
 			auto t = hrc::now();
 
-			cu::initialize<<<1, 1>>>(4U);
+			cu::initialize<<<1, 1>>>(1U);
 
 			cu::peel_zeros<<<nBlocks, MAX_THRD_BLK>>>(
 				thrust::raw_pointer_cast(d_kv.data()),
 				thrust::raw_pointer_cast(d_D.data()),
 				d_D.size());
 
-
-			CU_ERR( cudaPeekAtLastError() );
-			CU_ERR( cudaDeviceSynchronize() );
-			tms["constructing"] = hrc::now() - t;
-			std::cout << "CUDA constructing Bucket finished: "
-				<< tms["constructing"].count() << " ms" << std::endl;
+			CU_ERR(cudaPeekAtLastError());
+			CU_ERR(cudaDeviceSynchronize());
+			ts["Peeling zeros"] = hrc::now() - t;
 			
-			std::cout << "=========================================" << std::endl;
-			std::cout << "CUDA peeling Bucket ..." << std::endl;
-			auto nLoopCounter = 0U;
 			unsigned peeled = 0U;
 			t = hrc::now();
-			while(true) {
-				nLoopCounter++;
+			while (true)
+			{
 
 				cu::update_value_to_peel<<<1, 1>>>();
-					
+
 				peeling<<<nBlocks, MAX_THRD_BLK>>>(
-						thrust::raw_pointer_cast(d_E.data()),
-						thrust::raw_pointer_cast(d_kv.data()),
-						thrust::raw_pointer_cast(d_D.data()),
-						thrust::raw_pointer_cast(d_DD.data()),
-						thrust::raw_pointer_cast(d_O.data()),
-						d_D.size());
+					thrust::raw_pointer_cast(d_E.data()),
+					thrust::raw_pointer_cast(d_kv.data()),
+					thrust::raw_pointer_cast(d_D.data()),
+					thrust::raw_pointer_cast(d_DD.data()),
+					thrust::raw_pointer_cast(d_O.data()),
+					d_D.size());
 
 				cudaMemcpyFromSymbol(&peeled,
-									d_peeled,
-									sizeof(d_peeled),
-									0,
-									cudaMemcpyDeviceToHost);
-				if(peeled>=nV){
+									 d_peeled,
+									 sizeof(d_peeled),
+									 0,
+									 cudaMemcpyDeviceToHost);
+				if (peeled >= nV)
+				{
 					break;
 				}
 			} // End of while loop
-			
-			CU_ERR( cudaPeekAtLastError() );
-			CU_ERR( cudaDeviceSynchronize() ); // This is required
-		
-			tms["peeling"] = hrc::now() - t;
-			std::cout << "CUDA peeling Bucket finished: "
-				<< tms["peeling"].count() << " ms" << std::endl;
-			std::cout << "Total Kernel launches: "
-				<< nLoopCounter	<< std::endl;
-			std::cout << "=========================================" << std::endl;
-			std::cout << "Transferring data back to CPU ..." << std::endl;
 
+			CU_ERR(cudaPeekAtLastError());
+			CU_ERR(cudaDeviceSynchronize()); // This is required
+
+			ts["peeling"] = hrc::now() - t;
+
+			// Transferring data back to CPU
 			unsigned k_max;
 			cudaMemcpyFromSymbol(&k_max,
-								d_2peel_current,
-								sizeof(d_2peel_current),
-								0,
-								cudaMemcpyDeviceToHost);
+								 d_2peel_current,
+								 sizeof(d_2peel_current),
+								 0,
+								 cudaMemcpyDeviceToHost);
 
 			kv.resize(d_kv.size());
 			thrust::copy(d_kv.cbegin(), d_kv.cend(), kv.begin());
-			tms["all"] = milliseconds::zero();
-			for(const auto& tm: tms) {
-				if(tm.first!="all") {
-					tms["all"] += tm.second;
-				}
+			seconds total = seconds::zero();
+			for (const auto &tm : ts)
+			{
+				total += tm.second;
 			}
+			ts["Total"] = total;
 			return k_max;
 		} // End of run()
 	} // End of namespace kcore
 
-	namespace ktruss {
+	namespace ktruss
+	{
 		/**
-		* @brief Peeling for ktruss
-		* @param tris is the Triangles vector
-		* @param V is the values vector
-		* @param D is the degree vector
-		* @param DD is the mutable degree vector
-		* @param O is the offset vector
-		* @param sz Size of vector V, O, D and DD
-		*/
-		__global__
-		void peeling(const tri_t* tris,
-						MTYPE* V,
-						const VERTEX_T* D,
-						MTYPE* DD,
-						const VERTEX_T* O,
-						size_t sz) {
+		 * @brief Peeling for ktruss
+		 * @param tris is the Triangles vector
+		 * @param V is the values vector
+		 * @param D is the degree vector
+		 * @param DD is the mutable degree vector
+		 * @param O is the offset vector
+		 * @param sz Size of vector V, O, D and DD
+		 */
+		__global__ void peeling(const tri_t *tris,
+								MTYPE *V,
+								const VERTEX_T *D,
+								VERTEX_T *DD,
+								const VERTEX_T *O,
+								size_t sz)
+		{
 
 			int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-			if(i < sz && V[i] == -1 && DD[i] <= static_cast<MTYPE>(d_2peel_current*2)) {
-				atomicExch_system(&V[i], d_2peel_current);
-				atomicAdd(&d_peeled, 1);
-				
-				const auto& deg = D[i];
-				const auto& off = O[i];
+			if (i < sz && V[i] == -1 && DD[i] <= static_cast<MTYPE>(d_2peel_current * 2))
+			{
+				V[i] = d_2peel_current;
+				warp_aggregated_add(&d_peeled);
 
-				for(size_t g = 0; g < deg; g++) {
-					const auto& t = tris[off+g];
+				const auto &deg = D[i];
+				const auto &off = O[i];
+
+				for (size_t g = 0; g < deg; g++)
+				{
+					const auto &t = tris[off + g];
 					auto old_b = atomicSub_system(&DD[t.b], 1U);
 					auto old_c = atomicSub_system(&DD[t.c], 1U);
-					if(old_b == d_2peel_current+1
-						|| old_c == d_2peel_current+1
-					) {
+					if (old_b <= d_2peel_current + 1 || old_c <= d_2peel_current + 1)
+					{
 						d_2peel_next = d_2peel_current;
 					}
 				} // neighbors loop
@@ -1123,129 +1135,163 @@ namespace cu {
 		} // peeling(...)
 	} // End of namespace ktruss
 
-	namespace nucleus34 {
+	namespace nucleus34
+	{
 		/**
-		* @brief Peeling for nucleus34
-		* @param quds is the FC vector
-		* @param V is the values vector
-		* @param D is the degree vector
-		* @param DD is the mutable degree vector
-		* @param O is the offset vector
-		* @param sz Size of vector V, O, D and DD
-		*/
-		__global__
-		void peeling(const qud_t* quds,
-						MTYPE* V,
-						const VERTEX_T* D,
-						MTYPE* DD,
-						const VERTEX_T* O,
-						size_t sz) {
+		 * @brief Peeling for nucleus34
+		 * @param quds is the FC vector
+		 * @param V is the values vector
+		 * @param D is the degree vector
+		 * @param DD is the mutable degree vector
+		 * @param O is the offset vector
+		 * @param sz Size of vector V, O, D and DD
+		 */
+		__global__ void peeling(const qud_t *quds,
+								MTYPE *V,
+								const VERTEX_T *D,
+								MTYPE *DD,
+								const VERTEX_T *O,
+								size_t sz)
+		{
 
 			int i = blockIdx.x * blockDim.x + threadIdx.x;
-			const auto& actual_min = static_cast<MTYPE>(d_2peel_current * NUCLEUS34_FACTOR );
-			//const int v_debug = 3215; 
-			const int v_debug = 1669; 
+			const auto &actual_min = static_cast<MTYPE>(d_2peel_current * NUCLEUS34_FACTOR);
 
-			if(i < sz && V[i] == -1 && DD[i] <= actual_min) {
-				if(i==v_debug) {
-					MSG__("Peeling %d when min: %d, D: %u and DD: %d\n",
-						i, d_2peel_current, D[i], DD[i]);
-				}
-				atomicExch_system(&V[i], d_2peel_current);
-				atomicAdd(&d_peeled, 1);
-				
-				const auto& deg = D[i];
-				const auto& off = O[i];
+			if (i < sz && V[i] == -1 && DD[i] <= actual_min)
+			{
+				V[i] = d_2peel_current;
+				warp_aggregated_add(&d_peeled);
 
-				for(size_t g = 0; g < deg; g++) {
-					const auto& q = quds[off+g];
+				const auto &deg = D[i];
+				const auto &off = O[i];
+
+				const auto &nextMin = static_cast<MTYPE>(actual_min + 1);
+
+				for (size_t g = 0; g < deg; g++)
+				{
+					const auto &q = quds[off + g];
 					auto old_b = atomicSub_system(&DD[q.b], 1U);
 					auto old_c = atomicSub_system(&DD[q.c], 1U);
 					auto old_d = atomicSub_system(&DD[q.d], 1U);
-					if(q.b==v_debug) {
-						MSG__("Reducing %i when min is %u, by i: %d, D[i]: %u, DD[i]: %d, when DD is %d\n",
-							v_debug, d_2peel_current, i, D[i], DD[i], DD[q.b]);
-					}
-					if(q.c==v_debug) {
-						MSG__("Reducing %i when min is %u, by i: %d, D[i]: %u, DD[i]: %d, when DD is %d\n",
-							v_debug, d_2peel_current, i, D[i], DD[i], DD[q.c]);
-					}
-					if(q.d==v_debug) {
-						MSG__("Reducing %i when min is %u, by i: %d, D[i]: %u, DD[i]: %d, when DD is %d\n",
-							v_debug, d_2peel_current, i, D[i], DD[i], DD[q.d]);
-					}
-					//const auto& nextMin = static_cast<MTYPE>(d_2peel_current+1);
-					//const auto& nextMin = static_cast<MTYPE>((d_2peel_current+1)*NUCLEUS34_FACTOR);
-					const auto& nextMin = static_cast<MTYPE>(actual_min+1);
 
-					if(old_b <= nextMin || old_c <= nextMin || old_d <= nextMin) {
+					if (old_b <= nextMin || old_c <= nextMin || old_d <= nextMin)
+					{
 						d_2peel_next = d_2peel_current;
 					}
 				} // neighbors loop
 			} // kernel block
 		} // peeling(...)
-		
-		__global__
-		void peeling2(const dbl_t* dbls,
-						MTYPE* V,
-						const VERTEX_T* D,
-						MTYPE* DD,
-						const VERTEX_T* O,
-						size_t sz) {
+
+		__global__ void peeling2(const dbl_t *dbls,
+								 MTYPE *V,
+								 const VERTEX_T *D,
+								 MTYPE *DD,
+								 const VERTEX_T *O,
+								 size_t sz)
+		{
 
 			int i = blockIdx.x * blockDim.x + threadIdx.x;
-			const auto& actual_min = static_cast<MTYPE>(d_2peel_current /*NUCLEUS34_FACTOR*/ );
+			const auto &actual_min = static_cast<MTYPE>(d_2peel_current /*NUCLEUS34_FACTOR*/);
 
-			if(i < sz && V[i] == -1 && DD[i] <= actual_min) {
-				atomicExch(&V[i], d_2peel_current);
-				atomicAdd(&d_peeled, 1);
-				
-				const auto& deg = D[i];
-				const auto& off = O[i];
+			if (i < sz && V[i] == -1 && DD[i] <= actual_min)
+			{
+				// Each thread owns a unique `i`, so a plain store is sufficient.
+				V[i] = d_2peel_current;
+				warp_aggregated_add(&d_peeled);
 
-				for(size_t g = 0; g < deg; g++) {
-					const auto& q = dbls[off+g];
+				const auto &deg = D[i];
+				const auto &off = O[i];
+				const auto &nextMin = static_cast<MTYPE>(actual_min + 1);
+
+				for (size_t g = 0; g < deg; g++)
+				{
+					const auto &q = dbls[off + g];
 					auto old_b = atomicSub(&DD[q.b], 1);
-					//const auto& nextMin = static_cast<MTYPE>(d_2peel_current+1);
-					//const auto& nextMin = static_cast<MTYPE>((d_2peel_current+1)*NUCLEUS34_FACTOR);
-					const auto& nextMin = static_cast<MTYPE>(actual_min+1);
 
-					if(old_b == nextMin) {
+					if (old_b == nextMin)
+					{
 						d_2peel_next = d_2peel_current;
 					}
 				} // neighbors loop
 			} // kernel block
 		} // peeling(...)
+
+		/**
+		 * @brief Out-of-core variant of peeling2.
+		 *
+		 * Identical peeling semantics to peeling2, but:
+		 *  - the offset array `O` is templated on OFF_T so that 64-bit EDGE_T
+		 *    offsets can index an edge list with more than 2^32 entries, and
+		 *  - the thread index is computed in size_t so vertex counts above
+		 *    2^31 are addressed correctly.
+		 *
+		 * The `dbls` edge list may live in CUDA managed (unified) memory so it
+		 * can oversubscribe device memory; each slot is read exactly once over
+		 * the whole peeling (a single streaming pass), while the small vertex
+		 * arrays (V/D/DD/O) stay device-resident for fast atomics.
+		 */
+		template <typename OFF_T>
+		__global__ void peeling2_ext(const dbl_t *dbls,
+									 MTYPE *V,
+									 const VERTEX_T *D,
+									 MTYPE *DD,
+									 const OFF_T *O,
+									 size_t sz)
+		{
+			const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+			const auto actual_min = static_cast<MTYPE>(d_2peel_current);
+
+			if (i < sz && V[i] == -1 && DD[i] <= actual_min)
+			{
+				// Each thread owns a unique `i`, so a plain store is sufficient.
+				V[i] = d_2peel_current;
+				warp_aggregated_add(&d_peeled);
+
+				const auto deg = D[i];
+				const OFF_T off = O[i];
+				const auto nextMin = static_cast<MTYPE>(actual_min + 1);
+
+				for (size_t g = 0; g < deg; g++)
+				{
+					const auto &q = dbls[off + g];
+					auto old_b = atomicSub(&DD[q.b], 1);
+
+					if (old_b == nextMin)
+					{
+						d_2peel_next = d_2peel_current;
+					}
+				} // neighbors loop
+			} // kernel block
+		} // peeling2_ext(...)
 	} // End of namespace nucleus34
 
 	/**
 	 * Materialises a list of all triangles in a graph.
-	 * 
+	 *
 	 * The input is a graph represented in CSR format by one vector of length |E| that gives
 	 * the destination vertex of each edge sorted by the source vertex and
 	 * two vectors of length |V|, one that gives the degree of each i'th vertex and one
 	 * that gives the index in the length-|E| first vector at which the neighbours of the i'th
 	 * vertex begin.
-	 * 
+	 *
 	 * The output is the population of one vector of triangles. Three other pre-allocated
 	 * vectors of length |E| and one unallocated vector that will be of length |P2| (i.e., the
 	 * number of unique length-two paths in the graph) are also passed for storing itermediate
 	 * data structures.
 	 */
-	void compute_triangles( thrust::device_vector<VERTEX_T>		& d_vertex_degrees // const
-						, thrust::device_vector<EDGE_T>		& d_edge_offsets // const 
-						, thrust::device_vector<VERTEX_T>		& d_edge_destinations // const
-						, thrust::device_vector<VERTEX_T>      & d_edge_destination_degrees
-						, thrust::device_vector<EDGE_T>        & d_edge_destination_offsets
-						, thrust::device_vector<EDGE_T>        & d_path_offsets
-						, thrust::device_vector<INDEX_T>       & d_path_second_edge_indexes
-						, thrust::device_vector<tri_t>         & d_output_triangles )
+	void compute_triangles(thrust::device_vector<VERTEX_T> &d_vertex_degrees // const
+						   ,
+						   thrust::device_vector<EDGE_T> &d_edge_offsets // const
+						   ,
+						   thrust::device_vector<VERTEX_T> &d_edge_destinations // const
+						   ,
+						   thrust::device_vector<VERTEX_T> &d_edge_destination_degrees, thrust::device_vector<EDGE_T> &d_edge_destination_offsets, thrust::device_vector<EDGE_T> &d_path_offsets, thrust::device_vector<INDEX_T> &d_path_second_edge_indexes, thrust::device_vector<tri_t> &d_output_triangles)
 	{
 		auto const num_vertices = d_edge_offsets.size();
 		auto const num_edges = d_edge_destinations.size();
 		auto const max_capacity_output_triangles = d_output_triangles.size();
-		const dim3 nBlocks (blocks(num_edges), 1, 1);
-		
+		const dim3 nBlocks(blocks(num_edges), 1, 1);
+
 		// Broadly, the algorithm to materialise all triangles first materialises all
 		// length-two paths (u,v,w) and then finds triangles by intersecting that sorted
 		// vector with the sorted vector of edges to find matches (u,w). Then {u,v,w} is a triangle.
@@ -1267,34 +1313,293 @@ namespace cu {
 
 		// Populate temp structures d_edge_destination_degrees and d_edge_destination_offsets.
 		// Legacy notation: OE = O[E], DE = D[E]
-		cuTake<<<nBlocks, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_vertex_degrees.data() )
-										, thrust::raw_pointer_cast( d_edge_offsets.data() )
-										, thrust::raw_pointer_cast( d_edge_destinations.data() )
-										, thrust::raw_pointer_cast( d_edge_destination_degrees.data() )
-										, thrust::raw_pointer_cast( d_edge_destination_offsets.data() )
-										, num_edges );
+		cuTake<<<nBlocks, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_vertex_degrees.data()), thrust::raw_pointer_cast(d_edge_offsets.data()), thrust::raw_pointer_cast(d_edge_destinations.data()), thrust::raw_pointer_cast(d_edge_destination_degrees.data()), thrust::raw_pointer_cast(d_edge_destination_offsets.data()), num_edges);
 
 		// Materialise length-two paths in d_path_offsets and d_path_second_edge_indexes
 		// Legacy notaion: (OE, DE) =>  M, N
-		cu_multi_arrange( d_edge_destination_degrees
-						, d_edge_destination_offsets
-						, d_path_offsets
-						, d_path_second_edge_indexes );
+		cu_multi_arrange(d_edge_destination_degrees, d_edge_destination_offsets, d_path_offsets, d_path_second_edge_indexes);
 
 		// Do intersections to produce triangles
-		cu_cliques_tris<<<nBlocks, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_edge_destinations.data() )
-												, thrust::raw_pointer_cast( d_edge_offsets.data() )
-												, thrust::raw_pointer_cast( d_path_second_edge_indexes.data() )
-												, thrust::raw_pointer_cast( d_path_offsets.data() )
-												, num_edges
-												, num_vertices
-												, thrust::raw_pointer_cast( d_output_triangles.data() )
-												, max_capacity_output_triangles );
+		cu_cliques_tris<<<nBlocks, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_edge_destinations.data()), thrust::raw_pointer_cast(d_edge_offsets.data()), thrust::raw_pointer_cast(d_path_second_edge_indexes.data()), thrust::raw_pointer_cast(d_path_offsets.data()), num_edges, num_vertices, thrust::raw_pointer_cast(d_output_triangles.data()), max_capacity_output_triangles);
 
-		
+		CU_ERR(cudaPeekAtLastError());
+		CU_ERR(cudaDeviceSynchronize());
+	}
 
-		CU_ERR( cudaPeekAtLastError() );
-		CU_ERR( cudaDeviceSynchronize() );
+	// Fraction of currently-free device memory a single-shot clique-scratch
+	// allocation (the M index vectors plus the clique output upper bound) is
+	// allowed to occupy before the phase is split into memory-bounded segments.
+	// Leaves headroom for the cu_multi_arrange temporaries and the downstream
+	// allocations. Shared by the triangle and four-clique phases.
+	static constexpr double GPU_SCRATCH_MEM_SAFETY = 0.8;
+
+	// More conservative fraction used when *sizing* the memory-bounded segments
+	// (as opposed to the trigger decision above). The segment loop also pays for
+	// the transient cu_multi_arrange compacted arrays and thrust scan buffers, so
+	// the per-segment scratch budget is kept below this fraction of free memory.
+	static constexpr double SEG_SIZING_FRACTION = 0.6;
+
+	// Picks contiguous vertex boundaries [b0=0, b1, ..., bk=num_verts] such that
+	// the sum of per-edge memory weights (h_edge_bytes) over each segment's edge
+	// range stays at or below `cap` bytes. Edges of vertex v are
+	// [h_offsets[v], h_offsets[v+1]) (last vertex extends to num_edges). This is
+	// the path-count-aware analogue of an even split: because the clique scratch
+	// is sized by the sum of endpoint degrees (not the edge count), splitting by
+	// cumulative byte weight is what actually bounds peak memory under skew.
+	static std::vector<std::size_t> weight_aware_bounds(const std::vector<EDGE_T> &h_offsets,
+														std::size_t num_edges,
+														const std::vector<std::size_t> &h_edge_bytes,
+														std::size_t cap)
+	{
+		const std::size_t num_verts = h_offsets.size();
+		std::vector<std::size_t> bounds;
+		bounds.push_back(0);
+		if (num_verts == 0)
+		{
+			bounds.push_back(0);
+			return bounds;
+		}
+		if (cap == 0)
+			cap = 1;
+
+		std::size_t cur = 0;
+		for (std::size_t v = 0; v < num_verts; ++v)
+		{
+			const std::size_t eb = static_cast<std::size_t>(h_offsets[v]);
+			const std::size_t ee = (v + 1 < num_verts) ? static_cast<std::size_t>(h_offsets[v + 1]) : num_edges;
+			std::size_t vbytes = 0;
+			for (std::size_t e = eb; e < ee; ++e)
+				vbytes += h_edge_bytes[e];
+
+			// Close the current segment before adding this vertex if doing so would
+			// exceed the cap (but never emit an empty segment).
+			if (cur > 0 && cur + vbytes > cap)
+			{
+				bounds.push_back(v);
+				cur = vbytes;
+			}
+			else
+			{
+				cur += vbytes;
+			}
+		}
+		bounds.push_back(num_verts);
+		return bounds;
+	}
+
+	/**
+	 * Memory-bounded fallback for compute_triangles, used only when the
+	 * single-shot M (path second-edge indexes) and triangle-output upper-bound
+	 * allocation would not fit in device memory (very large graphs on a single
+	 * GPU). Datasets that fit never reach this path, so their runtime is
+	 * unaffected.
+	 *
+	 * Splits the oriented graph's vertices into contiguous ranges whose
+	 * *path-count* (Σ D[E[i]], the quantity that sizes M and the triangle output
+	 * upper bound) stays within a memory budget derived from the current free
+	 * device memory, then runs the cuTake / cu_multi_arrange / cu_cliques_tris_seg
+	 * pipeline on each range serially. Because the dominant scratch is sized by
+	 * the sum of endpoint degrees rather than the edge count, the split is driven
+	 * by cumulative byte weight (not edge count) so a skewed degree distribution
+	 * cannot leave one over-budget segment. `min_segments` is a lower bound on the
+	 * number of segments (e.g. the user-requested parts), the budget may produce
+	 * more. The discovered triangles are concatenated into d_output_triangles and
+	 * the running total is written back into d_global_num_triangles, preserving
+	 * the caller's contract (identical triangle set; the downstream sort in
+	 * build_triangles_graph normalises order).
+	 */
+	void compute_triangles_segmented(thrust::device_vector<VERTEX_T> &d_vertex_degrees,
+									 thrust::device_vector<EDGE_T> &d_edge_offsets,
+									 thrust::device_vector<VERTEX_T> &d_edge_destinations,
+									 std::size_t min_segments,
+									 thrust::device_vector<tri_t> &d_output_triangles)
+	{
+		const std::size_t num_vertices = d_edge_offsets.size();
+		const std::size_t num_edges = d_edge_destinations.size();
+
+		unsigned zero = 0;
+		if (num_vertices == 0 || num_edges == 0)
+		{
+			d_output_triangles.resize(1);
+			CU_ERR(cudaMemcpyToSymbol(d_global_num_triangles, &zero, sizeof(d_global_num_triangles), 0, cudaMemcpyHostToDevice));
+			return;
+		}
+
+		std::vector<EDGE_T> h_O(num_vertices);
+		thrust::copy(d_edge_offsets.begin(), d_edge_offsets.end(), h_O.begin());
+
+		// Per-edge memory weight (bytes): each edge (u,v) expands into D[v] paths,
+		// each costing sizeof(MTYPE) in M plus sizeof(tri_t) in the triangle
+		// output upper bound, plus a small fixed cost for the DE/OE/N scratch and
+		// the cu_multi_arrange temporaries.
+		constexpr std::size_t TRI_FIXED_PER_EDGE =
+			sizeof(VERTEX_T) + 2 * sizeof(EDGE_T) /* DE,OE,N */
+			+ sizeof(VERTEX_T) + 2 * sizeof(EDGE_T) /* multi_arrange compacted */;
+		std::vector<std::size_t> h_w(num_edges);
+		{
+			thrust::device_vector<std::size_t> d_w(num_edges);
+			VERTEX_T *p_D = thrust::raw_pointer_cast(d_vertex_degrees.data());
+			VERTEX_T *p_E = thrust::raw_pointer_cast(d_edge_destinations.data());
+			thrust::transform(thrust::counting_iterator<std::size_t>(0),
+							  thrust::counting_iterator<std::size_t>(num_edges),
+							  d_w.begin(),
+							  [p_D, p_E] __device__(std::size_t i)
+							  {
+								  std::size_t dv = static_cast<std::size_t>(p_D[p_E[i]]);
+								  return dv * (sizeof(MTYPE) + sizeof(tri_t)) + TRI_FIXED_PER_EDGE;
+							  });
+			thrust::copy(d_w.begin(), d_w.end(), h_w.begin());
+		}
+
+		// Total weight (bytes of dominant per-segment scratch). Kept for both the
+		// min_segments cap and the adaptive shrink below.
+		std::size_t total_w = 0;
+		for (std::size_t e = 0; e < num_edges; ++e)
+			total_w += h_w[e];
+
+		VERTEX_T *p_D = thrust::raw_pointer_cast(d_vertex_degrees.data());
+		EDGE_T *p_O = thrust::raw_pointer_cast(d_edge_offsets.data());
+		VERTEX_T *p_E = thrust::raw_pointer_cast(d_edge_destinations.data());
+
+		std::size_t total_tris = 0;
+
+		// Adaptive sizing: start from SEG_SIZING_FRACTION of free memory and, if a
+		// segment still cannot be allocated, shrink the fraction and re-segment so
+		// the pass converges to a working segment size instead of crashing.
+		double sizing = SEG_SIZING_FRACTION;
+		for (;;)
+		{
+			std::size_t free_bytes = 0, total_bytes = 0;
+			CU_ERR(cudaMemGetInfo(&free_bytes, &total_bytes));
+			std::size_t cap = static_cast<std::size_t>(static_cast<double>(free_bytes) * sizing);
+			if (cap == 0)
+				cap = 1;
+			if (min_segments > 1)
+			{
+				const std::size_t cap_by_count = std::max<std::size_t>(1, total_w / min_segments);
+				cap = std::min(cap, cap_by_count);
+			}
+
+			const std::vector<std::size_t> bounds = weight_aware_bounds(h_O, num_edges, h_w, cap);
+
+			bool oom = false;
+			try
+			{
+				d_output_triangles.clear();
+				d_output_triangles.shrink_to_fit();
+				total_tris = 0;
+
+				for (std::size_t s = 0; s + 1 < bounds.size(); ++s)
+				{
+					const std::size_t vb = bounds[s];
+					const std::size_t ve = bounds[s + 1];
+					if (ve <= vb)
+						continue;
+
+					const std::size_t db = static_cast<std::size_t>(h_O[vb]);
+					const std::size_t de = (ve < num_vertices) ? static_cast<std::size_t>(h_O[ve]) : num_edges;
+					const std::size_t seg_edges = de - db;
+					const std::size_t seg_verts = ve - vb;
+					if (seg_edges == 0)
+						continue;
+
+					// path_count = sum of D[E[i]] for i in [db, de): exact size of local M.
+					const std::size_t path_count = thrust::reduce(
+						thrust::make_permutation_iterator(d_vertex_degrees.begin(), d_edge_destinations.begin() + db),
+						thrust::make_permutation_iterator(d_vertex_degrees.begin(), d_edge_destinations.begin() + de),
+						std::size_t{0}, thrust::plus<std::size_t>());
+
+					thrust::device_vector<VERTEX_T> seg_DE(seg_edges, 0);
+					thrust::device_vector<EDGE_T> seg_OE(seg_edges, 0);
+					thrust::device_vector<EDGE_T> seg_N(seg_edges + 1, 0);
+					thrust::device_vector<INDEX_T> seg_M(path_count, 1);
+					thrust::device_vector<tri_t> seg_tris(path_count ? path_count : 1);
+
+					// Reset this device's triangle counter for the segment. Segments run
+					// serially here, so the shared counter is safe.
+					initialize_kernel<<<1, 1>>>();
+					CU_ERR(cudaDeviceSynchronize());
+
+					const dim3 nB_e(blocks(seg_edges), 1, 1);
+					cuTake<<<nB_e, MAX_THRD_BLK>>>(p_D, p_O, p_E + db,
+												   thrust::raw_pointer_cast(seg_DE.data()),
+												   thrust::raw_pointer_cast(seg_OE.data()), seg_edges);
+
+					cu_multi_arrange(seg_DE, seg_OE, seg_N, seg_M);
+
+					const dim3 nB_v(blocks(seg_verts), 1, 1);
+					cu_cliques_tris_seg<<<nB_v, MAX_THRD_BLK>>>(p_E, p_O,
+																thrust::raw_pointer_cast(seg_M.data()),
+																thrust::raw_pointer_cast(seg_N.data()),
+																num_edges, num_vertices, vb, ve, db,
+																thrust::raw_pointer_cast(seg_tris.data()),
+																seg_tris.size());
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+
+					unsigned seg_count = 0;
+					CU_ERR(cudaMemcpyFromSymbol(&seg_count, d_global_num_triangles, sizeof(d_global_num_triangles), 0, cudaMemcpyDeviceToHost));
+					if (static_cast<std::size_t>(seg_count) > seg_tris.size())
+					{
+						throw std::runtime_error("compute_triangles_segmented: per-segment output capacity exceeded.");
+					}
+
+					d_output_triangles.resize(total_tris + seg_count);
+					thrust::copy(seg_tris.cbegin(), seg_tris.cbegin() + seg_count, d_output_triangles.begin() + total_tris);
+					total_tris += seg_count;
+
+					// Progress on stderr: a run that dies later (or is killed by
+					// the wall clock) still reports how far the pass got and how
+					// fast the triangle total is growing.
+					{
+						std::size_t fb = 0, tb = 0;
+						cudaMemGetInfo(&fb, &tb);
+						std::cerr << "[tri] seg " << s << "/" << (bounds.size() - 1)
+								  << " verts[" << vb << "," << ve << ")"
+								  << " edges=" << seg_edges << " paths=" << path_count
+								  << " found=" << seg_count << " total=" << total_tris
+								  << " gpu_free=" << (fb >> 20) << "/" << (tb >> 20) << " MiB"
+								  << std::endl;
+					}
+				}
+			}
+			catch (const std::bad_alloc &)
+			{
+				oom = true;
+			}
+
+			if (!oom)
+				break;
+
+			// Clear any sticky CUDA error and drop the partial accumulation before
+			// retrying with smaller segments.
+			cudaGetLastError();
+			thrust::device_vector<tri_t>().swap(d_output_triangles);
+			total_tris = 0;
+
+			if (sizing <= 0.03)
+				throw std::runtime_error("compute_triangles_segmented: a single vertex's path expansion does not fit in device memory.");
+
+			sizing *= 0.5;
+			std::cerr << "[tri] segment allocation failed; retrying with sizing fraction "
+					  << sizing << std::endl;
+		}
+
+		if (d_output_triangles.empty())
+			d_output_triangles.resize(1); // keep a valid buffer for downstream code
+
+		// Restore the single-shot contract: d_global_num_triangles holds the total.
+		// The symbol is 32-bit, so a graph with more than 2^32-1 triangles cannot
+		// be represented; fail loudly instead of silently truncating the count.
+		if (total_tris > std::numeric_limits<unsigned>::max())
+		{
+			std::ostringstream os;
+			os << "compute_triangles_segmented: triangle count " << total_tris
+			   << " exceeds the 32-bit d_global_num_triangles counter.";
+			throw std::runtime_error(os.str());
+		}
+		unsigned total_u = static_cast<unsigned>(total_tris);
+		CU_ERR(cudaMemcpyToSymbol(d_global_num_triangles, &total_u, sizeof(d_global_num_triangles), 0, cudaMemcpyHostToDevice));
 	}
 
 	/**
@@ -1307,109 +1612,108 @@ namespace cu {
 	 * cuTake / cu_multi_arrange / cu_cliques_tris_seg on its segment only.
 	 */
 	template <typename U, typename V, size_t DIM>
-	std::vector<tri_t> compute_triangles_multi_gpu( const graph_t<U, V, DIM>& graph )
+	std::vector<std::vector<tri_t>> compute_triangles_multi_gpu_parts(const graph_t<U, V, DIM> &graph)
 	{
-		if( graph.split_parts.empty() ) {
-			throw std::runtime_error( "split_parts vector not initialized for multi-GPU call." );
+		if (graph.split_parts.empty())
+		{
+			throw std::runtime_error("split_parts vector not initialized for multi-GPU call.");
 		}
 
 		int num_devices = 0;
-		CU_ERR( cudaGetDeviceCount( &num_devices ) );
-		if( num_devices < 1 ) {
-			throw std::runtime_error( "No CUDA devices available." );
+		CU_ERR(cudaGetDeviceCount(&num_devices));
+		if (num_devices < 1)
+		{
+			throw std::runtime_error("No CUDA devices available.");
 		}
 
 		const size_t num_segments = graph.split_parts.size();
 		const size_t num_vertices = graph.O.size();
-		const size_t num_edges    = graph.size_edges();
+		const size_t num_edges = graph.size_edges();
 
-		std::vector<std::vector<tri_t>> per_seg( num_segments );
+		std::vector<std::vector<tri_t>> per_seg(num_segments);
 
 		int prev_device = -1;
-		cudaGetDevice( &prev_device );
+		cudaGetDevice(&prev_device);
 
-		for( size_t s = 0; s < num_segments; ++s )
+		for (size_t s = 0; s < num_segments; ++s)
 		{
-			const int dev = static_cast<int>( s % num_devices );
-			CU_ERR( cudaSetDevice( dev ) );
+			const int dev = static_cast<int>(s % num_devices);
+			CU_ERR(cudaSetDevice(dev));
 
 			const size_t vb = graph.split_parts[s];
-			const size_t ve = ( s + 1 < num_segments ) ? graph.split_parts[s+1] : num_vertices;
-			if( ve <= vb ) continue;
+			const size_t ve = (s + 1 < num_segments) ? graph.split_parts[s + 1] : num_vertices;
+			if (ve <= vb)
+				continue;
 
-			const size_t db = static_cast<size_t>( graph.O[vb] );
-			const size_t de = ( ve < num_vertices ) ? static_cast<size_t>( graph.O[ve] ) : num_edges;
+			const size_t db = static_cast<size_t>(graph.O[vb]);
+			const size_t de = (ve < num_vertices) ? static_cast<size_t>(graph.O[ve]) : num_edges;
 			const size_t seg_edges = de - db;
 			const size_t seg_verts = ve - vb;
-			if( seg_edges == 0 ) continue;
+			if (seg_edges == 0)
+				continue;
 
-			thrust::device_vector<VERTEX_T> d_D( graph.D );
-			thrust::device_vector<EDGE_T>   d_O( graph.O );
-			auto e_ptr = reinterpret_cast<const VERTEX_T*>( graph.E.data() );
-			thrust::device_vector<VERTEX_T> d_E( e_ptr, e_ptr + num_edges );
+			thrust::device_vector<VERTEX_T> d_D(graph.D);
+			thrust::device_vector<EDGE_T> d_O(graph.O);
+			auto e_ptr = reinterpret_cast<const VERTEX_T *>(graph.E.data());
+			thrust::device_vector<VERTEX_T> d_E(e_ptr, e_ptr + num_edges);
 
 			// path_count = sum of D[E[i]] for i in [db, de): exact size of local M
-			const size_t path_count = static_cast<size_t>( thrust::reduce(
-				thrust::make_permutation_iterator( d_D.begin(), d_E.begin() + db ),
-				thrust::make_permutation_iterator( d_D.begin(), d_E.begin() + de ) ) );
+			const size_t path_count = static_cast<size_t>(thrust::reduce(
+				thrust::make_permutation_iterator(d_D.begin(), d_E.begin() + db),
+				thrust::make_permutation_iterator(d_D.begin(), d_E.begin() + de)));
 
-			thrust::device_vector<VERTEX_T> d_DE( seg_edges, 0 );
-			thrust::device_vector<EDGE_T>   d_OE( seg_edges, 0 );
-			thrust::device_vector<EDGE_T>   d_N ( seg_edges + 1, 0 );
-			thrust::device_vector<INDEX_T>  d_M ( path_count, 1 );
-			thrust::device_vector<tri_t>    d_tris( path_count );
+			thrust::device_vector<VERTEX_T> d_DE(seg_edges, 0);
+			thrust::device_vector<EDGE_T> d_OE(seg_edges, 0);
+			thrust::device_vector<EDGE_T> d_N(seg_edges + 1, 0);
+			thrust::device_vector<INDEX_T> d_M(path_count, 1);
+			thrust::device_vector<tri_t> d_tris(path_count);
 
 			// Reset per-device global triangle counter
 			initialize_kernel<<<1, 1>>>();
-			CU_ERR( cudaDeviceSynchronize() );
+			CU_ERR(cudaDeviceSynchronize());
 
 			// cuTake on the local edge slice [db, de)
-			const dim3 nB_e( blocks( seg_edges ), 1, 1 );
-			cuTake<<<nB_e, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_D.data() )
-			                              , thrust::raw_pointer_cast( d_O.data() )
-			                              , thrust::raw_pointer_cast( d_E.data() ) + db
-			                              , thrust::raw_pointer_cast( d_DE.data() )
-			                              , thrust::raw_pointer_cast( d_OE.data() )
-			                              , seg_edges );
+			const dim3 nB_e(blocks(seg_edges), 1, 1);
+			cuTake<<<nB_e, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_D.data()), thrust::raw_pointer_cast(d_O.data()), thrust::raw_pointer_cast(d_E.data()) + db, thrust::raw_pointer_cast(d_DE.data()), thrust::raw_pointer_cast(d_OE.data()), seg_edges);
 
-			cu_multi_arrange( d_DE, d_OE, d_N, d_M );
+			cu_multi_arrange(d_DE, d_OE, d_N, d_M);
 
-			const dim3 nB_v( blocks( seg_verts ), 1, 1 );
-			cu_cliques_tris_seg<<<nB_v, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_E.data() )
-			                                           , thrust::raw_pointer_cast( d_O.data() )
-			                                           , thrust::raw_pointer_cast( d_M.data() )
-			                                           , thrust::raw_pointer_cast( d_N.data() )
-			                                           , num_edges
-			                                           , num_vertices
-			                                           , vb
-			                                           , ve
-			                                           , db
-			                                           , thrust::raw_pointer_cast( d_tris.data() )
-			                                           , d_tris.size() );
+			const dim3 nB_v(blocks(seg_verts), 1, 1);
+			cu_cliques_tris_seg<<<nB_v, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_E.data()), thrust::raw_pointer_cast(d_O.data()), thrust::raw_pointer_cast(d_M.data()), thrust::raw_pointer_cast(d_N.data()), num_edges, num_vertices, vb, ve, db, thrust::raw_pointer_cast(d_tris.data()), d_tris.size());
 
-			CU_ERR( cudaPeekAtLastError() );
-			CU_ERR( cudaDeviceSynchronize() );
+			CU_ERR(cudaPeekAtLastError());
+			CU_ERR(cudaDeviceSynchronize());
 
 			size_t seg_count = 0;
-			CU_ERR( cudaMemcpyFromSymbol( &seg_count, d_global_num_triangles
-			                            , sizeof( d_global_num_triangles ), 0
-			                            , cudaMemcpyDeviceToHost ) );
-			if( seg_count > d_tris.size() ) {
-				throw std::runtime_error( "compute_triangles_multi_gpu: per-segment output capacity exceeded." );
+			CU_ERR(cudaMemcpyFromSymbol(&seg_count, d_global_num_triangles, sizeof(d_global_num_triangles), 0, cudaMemcpyDeviceToHost));
+			if (seg_count > d_tris.size())
+			{
+				throw std::runtime_error("compute_triangles_multi_gpu: per-segment output capacity exceeded.");
 			}
 
-			per_seg[s].resize( seg_count );
-			thrust::copy( d_tris.cbegin(), d_tris.cbegin() + seg_count, per_seg[s].begin() );
+			per_seg[s].resize(seg_count);
+			thrust::copy(d_tris.cbegin(), d_tris.cbegin() + seg_count, per_seg[s].begin());
 		}
 
-		if( prev_device >= 0 ) cudaSetDevice( prev_device );
+		if (prev_device >= 0)
+			cudaSetDevice(prev_device);
 
+		return per_seg;
+	}
+
+	template <typename U, typename V, size_t DIM>
+	std::vector<tri_t> compute_triangles_multi_gpu(const graph_t<U, V, DIM> &graph)
+	{
+		auto per_seg = compute_triangles_multi_gpu_parts(graph);
 		size_t total = 0;
-		for( const auto& v : per_seg ) total += v.size();
+		for (const auto &v : per_seg)
+			total += v.size();
+
 		std::vector<tri_t> all;
-		all.reserve( total );
-		for( auto& v : per_seg ) {
-			all.insert( all.end(), v.begin(), v.end() );
+		all.reserve(total);
+		for (auto &v : per_seg)
+		{
+			all.insert(all.end(), v.begin(), v.end());
 		}
 		return all;
 	}
@@ -1431,163 +1735,420 @@ namespace cu {
 	 * Falls back to single-GPU execution when only one device is visible.
 	 */
 	template <typename U, typename V, size_t DIM>
-	std::vector<tri_t> compute_triangles_parted( const graph_t<U, V, DIM>& graph )
+	std::vector<std::vector<tri_t>> compute_triangles_parted_parts(const graph_t<U, V, DIM> &graph,
+																   seconds *gpu_time_out = nullptr)
 	{
-		if( graph.split_parts.empty() ) {
-			throw std::runtime_error( "split_parts vector not initialized for parted call." );
+		if (graph.split_parts.empty())
+		{
+			throw std::runtime_error("split_parts vector not initialized for parted call.");
 		}
 
 		int num_devices = 0;
-		CU_ERR( cudaGetDeviceCount( &num_devices ) );
-		if( num_devices < 1 ) {
-			throw std::runtime_error( "No CUDA devices available." );
+		CU_ERR(cudaGetDeviceCount(&num_devices));
+		if (num_devices < 1)
+		{
+			throw std::runtime_error("No CUDA devices available.");
 		}
 
 		const size_t num_segments = graph.split_parts.size();
 		const size_t num_vertices = graph.O.size();
-		const size_t num_edges    = graph.size_edges();
+		const size_t num_edges = graph.size_edges();
 
 		// Cap worker threads to min(num_devices, num_segments): launching more
 		// threads than segments would leave threads idle and risks setting a
 		// device that has no work assigned.
-		const size_t num_workers = std::min<size_t>( num_segments,
-		                                             static_cast<size_t>( num_devices ) );
+		const size_t num_workers = std::min<size_t>(num_segments,
+													static_cast<size_t>(num_devices));
 
-		std::vector<std::vector<tri_t>> per_seg( num_segments );
+		std::vector<std::vector<tri_t>> per_seg(num_segments);
+		std::vector<seconds> worker_gpu_times(num_workers, seconds::zero());
 		std::mutex err_mtx;
 		std::exception_ptr first_err = nullptr;
 
 		int prev_device = -1;
-		cudaGetDevice( &prev_device );
+		cudaGetDevice(&prev_device);
 
-		auto worker = [&]( int dev )
+		auto worker = [&](int dev)
 		{
-			try {
-				CU_ERR( cudaSetDevice( dev ) );
+			try
+			{
+				CU_ERR(cudaSetDevice(dev));
 
 				// Upload the full graph once per device; reused by every
 				// segment assigned to this device.
-				thrust::device_vector<VERTEX_T> d_D( graph.D );
-				thrust::device_vector<EDGE_T>   d_O( graph.O );
-				auto e_ptr = reinterpret_cast<const VERTEX_T*>( graph.E.data() );
-				thrust::device_vector<VERTEX_T> d_E( e_ptr, e_ptr + num_edges );
+				thrust::device_vector<VERTEX_T> d_D(graph.D);
+				thrust::device_vector<EDGE_T> d_O(graph.O);
+				auto e_ptr = reinterpret_cast<const VERTEX_T *>(graph.E.data());
+				thrust::device_vector<VERTEX_T> d_E(e_ptr, e_ptr + num_edges);
 
-				for( size_t s = static_cast<size_t>( dev ); s < num_segments; s += num_workers )
+				seconds local_gpu_time = seconds::zero();
+
+				for (size_t s = static_cast<size_t>(dev); s < num_segments; s += num_workers)
 				{
 					const size_t vb = graph.split_parts[s];
-					const size_t ve = ( s + 1 < num_segments ) ? graph.split_parts[s+1] : num_vertices;
-					if( ve <= vb ) continue;
+					const size_t ve = (s + 1 < num_segments) ? graph.split_parts[s + 1] : num_vertices;
+					if (ve <= vb)
+						continue;
 
-					const size_t db = static_cast<size_t>( graph.O[vb] );
-					const size_t de = ( ve < num_vertices ) ? static_cast<size_t>( graph.O[ve] ) : num_edges;
+					const size_t db = static_cast<size_t>(graph.O[vb]);
+					const size_t de = (ve < num_vertices) ? static_cast<size_t>(graph.O[ve]) : num_edges;
 					const size_t seg_edges = de - db;
 					const size_t seg_verts = ve - vb;
-					if( seg_edges == 0 ) continue;
+					if (seg_edges == 0)
+						continue;
 
 					// path_count = sum of D[E[i]] for i in [db, de): exact size of local M
-					const size_t path_count = static_cast<size_t>( thrust::reduce(
-						thrust::make_permutation_iterator( d_D.begin(), d_E.begin() + db ),
-						thrust::make_permutation_iterator( d_D.begin(), d_E.begin() + de ) ) );
+					auto t_gpu = hrc::now();
+					const size_t path_count = static_cast<size_t>(thrust::reduce(
+						thrust::make_permutation_iterator(d_D.begin(), d_E.begin() + db),
+						thrust::make_permutation_iterator(d_D.begin(), d_E.begin() + de)));
+					CU_ERR(cudaDeviceSynchronize());
+					local_gpu_time += hrc::now() - t_gpu;
 
-					thrust::device_vector<VERTEX_T> d_DE( seg_edges, 0 );
-					thrust::device_vector<EDGE_T>   d_OE( seg_edges, 0 );
-					thrust::device_vector<EDGE_T>   d_N ( seg_edges + 1, 0 );
-					thrust::device_vector<INDEX_T>  d_M ( path_count, 1 );
-					thrust::device_vector<tri_t>    d_tris( path_count );
+					thrust::device_vector<VERTEX_T> d_DE(seg_edges, 0);
+					thrust::device_vector<EDGE_T> d_OE(seg_edges, 0);
+					thrust::device_vector<EDGE_T> d_N(seg_edges + 1, 0);
+					thrust::device_vector<INDEX_T> d_M(path_count, 1);
+					thrust::device_vector<tri_t> d_tris(path_count);
 
 					// Reset this device's global triangle counter. Segments
 					// scheduled to the same device run serially within this
 					// thread, so the shared counter is safe.
+					t_gpu = hrc::now();
 					initialize_kernel<<<1, 1>>>();
-					CU_ERR( cudaDeviceSynchronize() );
+					CU_ERR(cudaDeviceSynchronize());
 
-					const dim3 nB_e( blocks( seg_edges ), 1, 1 );
-					cuTake<<<nB_e, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_D.data() )
-					                              , thrust::raw_pointer_cast( d_O.data() )
-					                              , thrust::raw_pointer_cast( d_E.data() ) + db
-					                              , thrust::raw_pointer_cast( d_DE.data() )
-					                              , thrust::raw_pointer_cast( d_OE.data() )
-					                              , seg_edges );
+					const dim3 nB_e(blocks(seg_edges), 1, 1);
+					cuTake<<<nB_e, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_D.data()), thrust::raw_pointer_cast(d_O.data()), thrust::raw_pointer_cast(d_E.data()) + db, thrust::raw_pointer_cast(d_DE.data()), thrust::raw_pointer_cast(d_OE.data()), seg_edges);
 
-					cu_multi_arrange( d_DE, d_OE, d_N, d_M );
+					cu_multi_arrange(d_DE, d_OE, d_N, d_M);
 
-					const dim3 nB_v( blocks( seg_verts ), 1, 1 );
-					cu_cliques_tris_seg<<<nB_v, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_E.data() )
-					                                           , thrust::raw_pointer_cast( d_O.data() )
-					                                           , thrust::raw_pointer_cast( d_M.data() )
-					                                           , thrust::raw_pointer_cast( d_N.data() )
-					                                           , num_edges
-					                                           , num_vertices
-					                                           , vb
-					                                           , ve
-					                                           , db
-					                                           , thrust::raw_pointer_cast( d_tris.data() )
-					                                           , d_tris.size() );
+					const dim3 nB_v(blocks(seg_verts), 1, 1);
+					cu_cliques_tris_seg<<<nB_v, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_E.data()), thrust::raw_pointer_cast(d_O.data()), thrust::raw_pointer_cast(d_M.data()), thrust::raw_pointer_cast(d_N.data()), num_edges, num_vertices, vb, ve, db, thrust::raw_pointer_cast(d_tris.data()), d_tris.size());
 
-					CU_ERR( cudaPeekAtLastError() );
-					CU_ERR( cudaDeviceSynchronize() );
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+					local_gpu_time += hrc::now() - t_gpu;
 
 					size_t seg_count = 0;
-					CU_ERR( cudaMemcpyFromSymbol( &seg_count, d_global_num_triangles
-					                            , sizeof( d_global_num_triangles ), 0
-					                            , cudaMemcpyDeviceToHost ) );
-					if( seg_count > d_tris.size() ) {
-						throw std::runtime_error( "compute_triangles_parted: per-segment output capacity exceeded." );
+					CU_ERR(cudaMemcpyFromSymbol(&seg_count, d_global_num_triangles, sizeof(d_global_num_triangles), 0, cudaMemcpyDeviceToHost));
+					if (seg_count > d_tris.size())
+					{
+						throw std::runtime_error("compute_triangles_parted: per-segment output capacity exceeded.");
 					}
 
-					per_seg[s].resize( seg_count );
-					thrust::copy( d_tris.cbegin(), d_tris.cbegin() + seg_count, per_seg[s].begin() );
+					per_seg[s].resize(seg_count);
+					thrust::copy(d_tris.cbegin(), d_tris.cbegin() + seg_count, per_seg[s].begin());
 				}
-			} catch (...) {
-				std::lock_guard<std::mutex> lk( err_mtx );
-				if( !first_err ) first_err = std::current_exception();
+
+				worker_gpu_times[static_cast<size_t>(dev)] = local_gpu_time;
+			}
+			catch (...)
+			{
+				std::lock_guard<std::mutex> lk(err_mtx);
+				if (!first_err)
+					first_err = std::current_exception();
 			}
 		};
 
 		std::vector<std::thread> threads;
-		threads.reserve( num_workers );
-		for( size_t i = 0; i < num_workers; ++i ) {
-			threads.emplace_back( worker, static_cast<int>( i ) );
+		threads.reserve(num_workers);
+		for (size_t i = 0; i < num_workers; ++i)
+		{
+			threads.emplace_back(worker, static_cast<int>(i));
 		}
-		for( auto& t : threads ) t.join();
+		for (auto &t : threads)
+			t.join();
 
-		if( prev_device >= 0 ) cudaSetDevice( prev_device );
+		if (prev_device >= 0)
+			cudaSetDevice(prev_device);
 
-		if( first_err ) std::rethrow_exception( first_err );
+		if (first_err)
+			std::rethrow_exception(first_err);
 
+		if (gpu_time_out)
+		{
+			*gpu_time_out = worker_gpu_times.empty()
+								? seconds::zero()
+								: *std::max_element(worker_gpu_times.cbegin(), worker_gpu_times.cend());
+		}
+
+		return per_seg;
+	}
+
+	template <typename U, typename V, size_t DIM>
+	std::vector<tri_t> compute_triangles_parted(const graph_t<U, V, DIM> &graph,
+												seconds *gpu_time_out = nullptr)
+	{
+		auto per_seg = compute_triangles_parted_parts(graph, gpu_time_out);
 		size_t total = 0;
-		for( const auto& v : per_seg ) total += v.size();
+		for (const auto &v : per_seg)
+			total += v.size();
+
 		std::vector<tri_t> all;
-		all.reserve( total );
-		for( auto& v : per_seg ) {
-			all.insert( all.end(), v.begin(), v.end() );
+		all.reserve(total);
+		for (auto &v : per_seg)
+		{
+			all.insert(all.end(), v.begin(), v.end());
 		}
 		return all;
 	}
 
-	void build_triangles_graph( thrust::device_vector<tri_t>    & d_triangles
-							, thrust::device_vector<VERTEX_T> & d_triangles_degrees
-							, thrust::device_vector<VERTEX_T> & d_triangles_offsets
-							, std::size_t                       num_triangles )
+	void build_triangles_graph(thrust::device_vector<tri_t> &d_triangles, thrust::device_vector<VERTEX_T> &d_triangles_degrees, thrust::device_vector<VERTEX_T> &d_triangles_offsets, std::size_t num_triangles)
 	{
-		if(num_triangles)
+		if (num_triangles)
 		{
-			thrust::sort( d_triangles.begin(), d_triangles.begin() + num_triangles );
+			thrust::sort(d_triangles.begin(), d_triangles.begin() + num_triangles);
 
-			dim3 nBlocks (blocks(num_triangles), 1, 1);
-			cu_build_trisD<<<nBlocks, MAX_THRD_BLK>>>( thrust::raw_pointer_cast( d_triangles.data() )
-													, num_triangles
-													, thrust::raw_pointer_cast( d_triangles_degrees.data() ) );
+			dim3 nBlocks(blocks(num_triangles), 1, 1);
+			cu_build_trisD<<<nBlocks, MAX_THRD_BLK>>>(thrust::raw_pointer_cast(d_triangles.data()), num_triangles, thrust::raw_pointer_cast(d_triangles_degrees.data()));
 
-			thrust::exclusive_scan( d_triangles_degrees.begin()
-								, d_triangles_degrees.end()
-								, d_triangles_offsets.begin()
-								, 0 );
-			
-			CU_ERR( cudaPeekAtLastError() );
-			CU_ERR( cudaDeviceSynchronize() );
+			thrust::exclusive_scan(d_triangles_degrees.begin(), d_triangles_degrees.end(), d_triangles_offsets.begin(), 0);
+
+			CU_ERR(cudaPeekAtLastError());
+			CU_ERR(cudaDeviceSynchronize());
 		}
 		// else there are no triangles, so don't do anything
+	}
+
+	/**
+	 * Memory-bounded fallback for compute_fourcliques, used only when the
+	 * single-shot M0/M1/quds allocation would not fit in device memory (very
+	 * large graphs). Datasets that fit never reach this path, so their runtime
+	 * is unaffected.
+	 *
+	 * Splits the triangle-graph vertices into contiguous ranges whose
+	 * *path-count* (Σ of triangle-graph endpoint degrees, the quantity that sizes
+	 * M0/M1 and the four-clique output upper bound) stays within a memory budget
+	 * derived from the current free device memory, then runs the
+	 * cu_take_quds_seg / cu_multi_arrange / cu_cliques_quds_seg pipeline on each
+	 * range serially. Because the dominant scratch is sized by the sum of endpoint
+	 * degrees rather than the triangle (edge) count, the split is driven by
+	 * cumulative byte weight (not edge count) so a skewed triangle-graph degree
+	 * distribution cannot leave one over-budget segment. `min_segments` is a lower
+	 * bound on the number of segments (e.g. the user-requested parts); the budget
+	 * may produce more.
+	 *
+	 * The discovered four-cliques are accumulated on the *host* during the loop so
+	 * the growing result never competes with the per-segment device scratch, then
+	 * uploaded into d_quds once at the end. The running total is written back into
+	 * d_global_num_4cliques, preserving the caller's contract (identical
+	 * four-clique set; the downstream sort normalises order).
+	 */
+	void compute_fourcliques_segmented(thrust::device_vector<VERTEX_T> &d_triangles_degrees,
+									   thrust::device_vector<EDGE_T> &d_triangles_offsets,
+									   thrust::device_vector<tri_t> &d_triangles,
+									   std::size_t num_triangles,
+									   std::size_t min_segments,
+									   thrust::device_vector<qud_t> &d_quds)
+	{
+		const std::size_t num_tverts = d_triangles_offsets.size();
+		if (num_tverts == 0 || num_triangles == 0)
+		{
+			d_quds.resize(1);
+			unsigned zero = 0;
+			CU_ERR(cudaMemcpyToSymbol(d_global_num_4cliques, &zero, sizeof(d_global_num_4cliques), 0, cudaMemcpyHostToDevice));
+			return;
+		}
+
+		std::vector<EDGE_T> h_trisO(num_tverts);
+		thrust::copy(d_triangles_offsets.begin(), d_triangles_offsets.end(), h_trisO.begin());
+
+		// Per-triangle memory weight (bytes): triangle i expands the b-component
+		// into D[b] paths (M0 at sizeof(MTYPE) plus the quds upper bound at
+		// sizeof(qud_t)) and the c-component into D[c] paths (M1 at sizeof(MTYPE)),
+		// plus a small fixed cost for the DE/OE/N scratch and cu_multi_arrange
+		// temporaries.
+		constexpr std::size_t FC_FIXED_PER_EDGE =
+			2 * sizeof(VERTEX_T) + 4 * sizeof(EDGE_T) /* DE_b,DE_c,OE_b,OE_c,N0,N1 */
+			+ 2 * (sizeof(VERTEX_T) + 2 * sizeof(EDGE_T)) /* multi_arrange compacted x2 */;
+		std::vector<std::size_t> h_w(num_triangles);
+		{
+			thrust::device_vector<std::size_t> d_w(num_triangles);
+			VERTEX_T *p_trisD = thrust::raw_pointer_cast(d_triangles_degrees.data());
+			tri_t *p_tris = thrust::raw_pointer_cast(d_triangles.data());
+			thrust::transform(thrust::counting_iterator<std::size_t>(0),
+							  thrust::counting_iterator<std::size_t>(num_triangles),
+							  d_w.begin(),
+							  [p_trisD, p_tris] __device__(std::size_t i)
+							  {
+								  std::size_t db = static_cast<std::size_t>(p_trisD[p_tris[i].b]);
+								  std::size_t dc = static_cast<std::size_t>(p_trisD[p_tris[i].c]);
+								  return db * (sizeof(MTYPE) + sizeof(qud_t)) + dc * sizeof(MTYPE) + FC_FIXED_PER_EDGE;
+							  });
+			thrust::copy(d_w.begin(), d_w.end(), h_w.begin());
+		}
+
+		// Total weight (bytes of dominant per-segment scratch). Kept for both the
+		// min_segments cap and the adaptive shrink below.
+		std::size_t total_w = 0;
+		for (std::size_t e = 0; e < num_triangles; ++e)
+			total_w += h_w[e];
+
+		VERTEX_T *p_trisD = thrust::raw_pointer_cast(d_triangles_degrees.data());
+		EDGE_T *p_trisO = thrust::raw_pointer_cast(d_triangles_offsets.data());
+		tri_t *p_tris = thrust::raw_pointer_cast(d_triangles.data());
+
+		// Accumulate the result on the host so device memory stays free for the
+		// next segment's scratch.
+		std::vector<qud_t> h_out;
+		std::size_t total_quds = 0;
+
+		// Adaptive sizing: start from SEG_SIZING_FRACTION of free memory and, if a
+		// segment still cannot be allocated (the static byte estimate can miss
+		// transient thrust temporaries or fragmentation), shrink the fraction and
+		// re-segment. This guarantees the pass converges to a working segment size
+		// down to the per-vertex floor instead of crashing with bad_alloc.
+		double sizing = SEG_SIZING_FRACTION;
+		for (;;)
+		{
+			std::size_t free_bytes = 0, total_bytes = 0;
+			CU_ERR(cudaMemGetInfo(&free_bytes, &total_bytes));
+			std::size_t cap = static_cast<std::size_t>(static_cast<double>(free_bytes) * sizing);
+			if (cap == 0)
+				cap = 1;
+			if (min_segments > 1)
+			{
+				const std::size_t cap_by_count = std::max<std::size_t>(1, total_w / min_segments);
+				cap = std::min(cap, cap_by_count);
+			}
+
+			const std::vector<std::size_t> bounds = weight_aware_bounds(h_trisO, num_triangles, h_w, cap);
+
+			bool oom = false;
+			try
+			{
+				h_out.clear();
+				total_quds = 0;
+
+				for (std::size_t s = 0; s + 1 < bounds.size(); ++s)
+				{
+					const std::size_t vb = bounds[s];
+					const std::size_t ve = bounds[s + 1];
+					if (ve <= vb)
+						continue;
+
+					const std::size_t db = static_cast<std::size_t>(h_trisO[vb]);
+					const std::size_t de = (ve < num_tverts) ? static_cast<std::size_t>(h_trisO[ve]) : num_triangles;
+					const std::size_t seg_size = de - db; // triangles indexed by this segment
+					const std::size_t seg_verts = ve - vb;
+					if (seg_size == 0)
+						continue;
+
+					thrust::device_vector<VERTEX_T> seg_DE_b(seg_size, 0);
+					thrust::device_vector<VERTEX_T> seg_DE_c(seg_size, 0);
+					thrust::device_vector<EDGE_T> seg_OE_b(seg_size, 0);
+					thrust::device_vector<EDGE_T> seg_OE_c(seg_size, 0);
+					thrust::device_vector<EDGE_T> seg_N0(seg_size + 1, 0);
+					thrust::device_vector<EDGE_T> seg_N1(seg_size + 1, 0);
+
+					// Reset this device's four-clique counter for the segment. Segments
+					// run serially here, so the shared counter is safe.
+					initialize_kernel<<<1, 1>>>();
+					CU_ERR(cudaDeviceSynchronize());
+
+					const dim3 nB_t(blocks(seg_size), 1, 1);
+					cu_take_quds_seg<<<nB_t, MAX_THRD_BLK>>>(
+						p_trisD, p_trisO, p_tris, db, seg_size,
+						thrust::raw_pointer_cast(seg_DE_b.data()),
+						thrust::raw_pointer_cast(seg_DE_c.data()),
+						thrust::raw_pointer_cast(seg_OE_b.data()),
+						thrust::raw_pointer_cast(seg_OE_c.data()));
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+
+					const std::size_t pm0 = thrust::reduce(seg_DE_b.begin(), seg_DE_b.end(), std::size_t{0}, thrust::plus<std::size_t>());
+					const std::size_t pm1 = thrust::reduce(seg_DE_c.begin(), seg_DE_c.end(), std::size_t{0}, thrust::plus<std::size_t>());
+
+					thrust::device_vector<MTYPE> seg_M0(pm0, 1);
+					thrust::device_vector<MTYPE> seg_M1(pm1, 1);
+					thrust::device_vector<qud_t> seg_quds(pm0 ? pm0 : 1);
+
+					cu_multi_arrange(seg_DE_b, seg_OE_b, seg_N0, seg_M0);
+					cu_multi_arrange(seg_DE_c, seg_OE_c, seg_N1, seg_M1);
+
+					const dim3 nB_v(blocks(seg_verts), 1, 1);
+					cu_cliques_quds_seg<<<nB_v, MAX_THRD_BLK>>>(
+						p_tris, p_trisO,
+						thrust::raw_pointer_cast(seg_M0.data()),
+						thrust::raw_pointer_cast(seg_N0.data()),
+						thrust::raw_pointer_cast(seg_M1.data()),
+						thrust::raw_pointer_cast(seg_N1.data()),
+						num_triangles, num_tverts, vb, ve, db,
+						thrust::raw_pointer_cast(seg_quds.data()),
+						seg_quds.size());
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+
+					unsigned seg_count = 0;
+					CU_ERR(cudaMemcpyFromSymbol(&seg_count, d_global_num_4cliques, sizeof(d_global_num_4cliques), 0, cudaMemcpyDeviceToHost));
+					if (static_cast<std::size_t>(seg_count) > seg_quds.size())
+					{
+						throw std::runtime_error("compute_fourcliques_segmented: per-segment output capacity exceeded.");
+					}
+
+					h_out.resize(total_quds + seg_count);
+					thrust::copy(seg_quds.cbegin(), seg_quds.cbegin() + seg_count, h_out.begin() + total_quds);
+					total_quds += seg_count;
+
+					// Progress on stderr. The four-clique total is what decides
+					// whether the downstream device-resident peel can fit at all,
+					// so report it (and the host bytes it already costs) as it
+					// grows rather than only at the end.
+					{
+						std::size_t fb = 0, tb = 0;
+						cudaMemGetInfo(&fb, &tb);
+						std::cerr << "[fc] seg " << s << "/" << (bounds.size() - 1)
+								  << " tverts[" << vb << "," << ve << ")"
+								  << " tris=" << seg_size << " paths_b=" << pm0 << " paths_c=" << pm1
+								  << " found=" << seg_count << " total=" << total_quds
+								  << " host_quds=" << ((total_quds * sizeof(qud_t)) >> 20) << " MiB"
+								  << " gpu_free=" << (fb >> 20) << "/" << (tb >> 20) << " MiB"
+								  << std::endl;
+					}
+				}
+			}
+			catch (const std::bad_alloc &)
+			{
+				oom = true;
+			}
+
+			if (!oom)
+				break;
+
+			// Clear any sticky CUDA error left by the failed allocation and drop
+			// the partial host accumulation before retrying with smaller segments.
+			cudaGetLastError();
+			std::vector<qud_t>().swap(h_out);
+			total_quds = 0;
+
+			if (sizing <= 0.03)
+				throw std::runtime_error("compute_fourcliques_segmented: a single triangle-graph vertex's path expansion does not fit in device memory.");
+
+			sizing *= 0.5;
+			std::cerr << "[fc] segment allocation failed; retrying with sizing fraction "
+					  << sizing << std::endl;
+		}
+
+		std::vector<std::size_t>().swap(h_w); // free per-edge weights now that all retries succeeded
+
+		// Upload the concatenated result back to the device for the caller.
+		d_quds.resize(total_quds ? total_quds : 1);
+		if (total_quds)
+			thrust::copy(h_out.begin(), h_out.end(), d_quds.begin());
+
+		// Restore the single-shot contract: d_global_num_4cliques holds the total.
+		// As with the triangle counter this symbol is 32-bit; report the overflow
+		// rather than handing the caller a truncated four-clique set.
+		if (total_quds > std::numeric_limits<unsigned>::max())
+		{
+			std::ostringstream os;
+			os << "compute_fourcliques_segmented: four-clique count " << total_quds
+			   << " exceeds the 32-bit d_global_num_4cliques counter.";
+			throw std::runtime_error(os.str());
+		}
+		unsigned total_u = static_cast<unsigned>(total_quds);
+		CU_ERR(cudaMemcpyToSymbol(d_global_num_4cliques, &total_u, sizeof(d_global_num_4cliques), 0, cudaMemcpyHostToDevice));
 	}
 
 	/**
@@ -1603,43 +2164,87 @@ namespace cu {
 	 * caller must pre-allocate (sized as in the original code). d_M0, d_M1 and
 	 * d_quds are sized internally based on the per-component path counts, which
 	 * are not known until cu_take_quds has run.
+	 *
+	 * When the single-shot M0/M1/quds allocation would exceed the available
+	 * device memory (very large graphs on a single GPU), the work is transparently
+	 * routed through compute_fourcliques_segmented so it stays within budget.
+	 * Datasets that fit take the original single-pass path unchanged.
 	 */
-	void compute_fourcliques( thrust::device_vector<VERTEX_T>      & d_triangles_degrees
-							, thrust::device_vector<EDGE_T>        & d_triangles_offsets
-							, thrust::device_vector<tri_t>         & d_triangles
-							, std::size_t                            num_triangles
-							, thrust::device_vector<VERTEX_T>      & d_DE_b
-							, thrust::device_vector<VERTEX_T>      & d_DE_c
-							, thrust::device_vector<EDGE_T>        & d_OE_b
-							, thrust::device_vector<EDGE_T>        & d_OE_c
-							, thrust::device_vector<EDGE_T>        & d_N0
-							, thrust::device_vector<EDGE_T>        & d_N1
-							, thrust::device_vector<MTYPE>         & d_M0
-							, thrust::device_vector<MTYPE>         & d_M1
-							, thrust::device_vector<qud_t>         & d_quds )
+	void compute_fourcliques(thrust::device_vector<VERTEX_T> &d_triangles_degrees, thrust::device_vector<EDGE_T> &d_triangles_offsets, thrust::device_vector<tri_t> &d_triangles, std::size_t num_triangles, thrust::device_vector<VERTEX_T> &d_DE_b, thrust::device_vector<VERTEX_T> &d_DE_c, thrust::device_vector<EDGE_T> &d_OE_b, thrust::device_vector<EDGE_T> &d_OE_c, thrust::device_vector<EDGE_T> &d_N0, thrust::device_vector<EDGE_T> &d_N1, thrust::device_vector<MTYPE> &d_M0, thrust::device_vector<MTYPE> &d_M1, thrust::device_vector<qud_t> &d_quds)
 	{
-		const dim3 nBlocks (blocks(num_triangles * 4), 1, 1);
+		const dim3 nBlocks(blocks(num_triangles * 4), 1, 1);
 
 		// Materialise triangle-graph endpoint degrees/offsets along the b- and
 		// c-components for each triangle. Legacy notation: DE = D[E], OE = O[E].
 		cu_take_quds<<<nBlocks, MAX_THRD_BLK>>>(
-				thrust::raw_pointer_cast(d_triangles_degrees.data()),
-				thrust::raw_pointer_cast(d_triangles_offsets.data()),
-				thrust::raw_pointer_cast(d_triangles.data()),
-				num_triangles,
-				thrust::raw_pointer_cast(d_DE_b.data()),
-				thrust::raw_pointer_cast(d_DE_c.data()),
-				thrust::raw_pointer_cast(d_OE_b.data()),
-				thrust::raw_pointer_cast(d_OE_c.data()));
+			thrust::raw_pointer_cast(d_triangles_degrees.data()),
+			thrust::raw_pointer_cast(d_triangles_offsets.data()),
+			thrust::raw_pointer_cast(d_triangles.data()),
+			num_triangles,
+			thrust::raw_pointer_cast(d_DE_b.data()),
+			thrust::raw_pointer_cast(d_DE_c.data()),
+			thrust::raw_pointer_cast(d_OE_b.data()),
+			thrust::raw_pointer_cast(d_OE_c.data()));
 
-		CU_ERR( cudaPeekAtLastError() );
-		CU_ERR( cudaDeviceSynchronize() );
+		CU_ERR(cudaPeekAtLastError());
+		CU_ERR(cudaDeviceSynchronize());
 
 		// path_count_m0/m1 = sum of triangle-graph endpoint degrees along the
 		// b- and c-components respectively. These are the exact sizes for M0/M1
 		// (FC path second-edge indexes) and upper bounds on four-cliques.
-		auto path_count_m0 = static_cast<size_t>(thrust::reduce(d_DE_b.begin(), d_DE_b.end()));
-		auto path_count_m1 = static_cast<size_t>(thrust::reduce(d_DE_c.begin(), d_DE_c.end()));
+		// Accumulate in size_t: the per-element degrees are VERTEX_T (32-bit)
+		// but their sum (the number of length-two paths in the triangle graph)
+		// routinely exceeds 2^32 on large graphs. Letting thrust::reduce default
+		// to the VERTEX_T accumulator overflows and under-sizes M0/M1/quds,
+		// causing out-of-bounds accesses in cu_cliques_quds.
+		auto path_count_m0 = thrust::reduce(d_DE_b.begin(), d_DE_b.end(), std::size_t{0}, thrust::plus<std::size_t>());
+		auto path_count_m1 = thrust::reduce(d_DE_c.begin(), d_DE_c.end(), std::size_t{0}, thrust::plus<std::size_t>());
+
+		// Decide whether the single-shot M0/M1/quds allocation fits in device
+		// memory. Graphs that fit (the common case) take the original single-pass
+		// pipeline below unchanged; only a cheap cudaMemGetInfo and a comparison
+		// are added, so their runtime is unaffected. Very large graphs whose
+		// scratch would exceed the budget are routed through the memory-bounded
+		// segmented pass instead of crashing with an out-of-memory error.
+		const std::size_t single_shot_bytes =
+			path_count_m0 * sizeof(MTYPE) +
+			path_count_m1 * sizeof(MTYPE) +
+			(path_count_m0 ? path_count_m0 : 1) * sizeof(qud_t);
+
+		std::size_t free_bytes = 0, total_bytes = 0;
+		CU_ERR(cudaMemGetInfo(&free_bytes, &total_bytes));
+		const std::size_t budget = static_cast<std::size_t>(static_cast<double>(free_bytes) * GPU_SCRATCH_MEM_SAFETY);
+
+		if (budget > 0 && single_shot_bytes > budget)
+		{
+			// Release the full-size scratch the single-shot path would have used
+			// (already consumed above) so the segmented pass gets maximum memory.
+			thrust::device_vector<VERTEX_T>().swap(d_DE_b);
+			thrust::device_vector<VERTEX_T>().swap(d_DE_c);
+			thrust::device_vector<EDGE_T>().swap(d_OE_b);
+			thrust::device_vector<EDGE_T>().swap(d_OE_c);
+			thrust::device_vector<EDGE_T>().swap(d_N0);
+			thrust::device_vector<EDGE_T>().swap(d_N1);
+			thrust::device_vector<MTYPE>().swap(d_M0);
+			thrust::device_vector<MTYPE>().swap(d_M1);
+
+			std::cerr << "[fc] single-shot four-clique scratch ~" << (single_shot_bytes >> 20)
+					  << " MiB exceeds budget ~" << (budget >> 20)
+					  << " MiB; using path-count-aware segmented pass" << std::endl;
+
+			// Seed the segmented pass with a minimum segment count so its first
+			// attempt is already fine-grained: size each segment for roughly half
+			// the currently-free memory. The segmented pass refines this further
+			// (and shrinks adaptively if a segment still cannot be allocated).
+			const std::size_t seg_seed_budget =
+				std::max<std::size_t>(1, static_cast<std::size_t>(static_cast<double>(free_bytes) * 0.5));
+			std::size_t fc_min_segments = (single_shot_bytes + seg_seed_budget - 1) / seg_seed_budget;
+			fc_min_segments = std::max<std::size_t>(fc_min_segments, 2);
+
+			compute_fourcliques_segmented(d_triangles_degrees, d_triangles_offsets,
+										  d_triangles, num_triangles, fc_min_segments, d_quds);
+			return;
+		}
 
 		// Exact size per M vector; pre-filled with 1 to avoid resize during timing.
 		d_M0.assign(path_count_m0, 1);
@@ -1656,19 +2261,19 @@ namespace cu {
 
 		// Do intersections to produce four-cliques
 		cu_cliques_quds<<<nBlocks, MAX_THRD_BLK>>>(
-				thrust::raw_pointer_cast(d_triangles.data()),
-				thrust::raw_pointer_cast(d_triangles_offsets.data()),
-				thrust::raw_pointer_cast(d_M0.data()),
-				thrust::raw_pointer_cast(d_N0.data()),
-				thrust::raw_pointer_cast(d_M1.data()),
-				thrust::raw_pointer_cast(d_N1.data()),
-				num_triangles,
-				d_triangles_offsets.size(),
-				thrust::raw_pointer_cast(d_quds.data()),
-				d_quds.size());
+			thrust::raw_pointer_cast(d_triangles.data()),
+			thrust::raw_pointer_cast(d_triangles_offsets.data()),
+			thrust::raw_pointer_cast(d_M0.data()),
+			thrust::raw_pointer_cast(d_N0.data()),
+			thrust::raw_pointer_cast(d_M1.data()),
+			thrust::raw_pointer_cast(d_N1.data()),
+			num_triangles,
+			d_triangles_offsets.size(),
+			thrust::raw_pointer_cast(d_quds.data()),
+			d_quds.size());
 
-		CU_ERR( cudaPeekAtLastError() );
-		CU_ERR( cudaDeviceSynchronize() );
+		CU_ERR(cudaPeekAtLastError());
+		CU_ERR(cudaDeviceSynchronize());
 	}
 
 	/**
@@ -1687,276 +2292,347 @@ namespace cu {
 	 * After all threads join the per-segment buffers are concatenated.
 	 */
 	template <typename U, typename V>
-	std::vector<qud_t> compute_fourcliques_parted( const graph_t<U, V, 2>& tgraph
-	                                             , const std::vector<tri_t>& tris )
+	std::vector<std::vector<qud_t>> compute_fourcliques_parted_parts(const graph_t<U, V, 2> &tgraph,
+																	 const std::vector<tri_t> &tris,
+																	 seconds *gpu_time_out = nullptr)
 	{
-		if( tgraph.split_parts.empty() ) {
-			throw std::runtime_error( "split_parts vector not initialized for parted call." );
+		if (tgraph.split_parts.empty())
+		{
+			throw std::runtime_error("split_parts vector not initialized for parted call.");
 		}
 
 		int num_devices = 0;
-		CU_ERR( cudaGetDeviceCount( &num_devices ) );
-		if( num_devices < 1 ) {
-			throw std::runtime_error( "No CUDA devices available." );
+		CU_ERR(cudaGetDeviceCount(&num_devices));
+		if (num_devices < 1)
+		{
+			throw std::runtime_error("No CUDA devices available.");
 		}
 
-		const size_t num_segments  = tgraph.split_parts.size();
-		const size_t num_tverts    = tgraph.size_vertices();   // = tgraph.O.size() = tgraph.D.size()
-		const size_t num_triangles = tgraph.size_edges();      // = tgraph.E.size() = tris.size()
-		if( tris.size() != num_triangles ) {
-			throw std::runtime_error( "compute_fourcliques_parted: tris.size() must equal tgraph.size_edges()." );
+		const size_t num_segments = tgraph.split_parts.size();
+		const size_t num_tverts = tgraph.size_vertices(); // = tgraph.O.size() = tgraph.D.size()
+		const size_t num_triangles = tgraph.size_edges(); // = tgraph.E.size() = tris.size()
+		if (tris.size() != num_triangles)
+		{
+			throw std::runtime_error("compute_fourcliques_parted: tris.size() must equal tgraph.size_edges().");
 		}
 
-		const size_t num_workers = std::min<size_t>( num_segments,
-		                                             static_cast<size_t>( num_devices ) );
+		const size_t num_workers = std::min<size_t>(num_segments,
+													static_cast<size_t>(num_devices));
 
-		std::vector<std::vector<qud_t>> per_seg( num_segments );
+		std::vector<std::vector<qud_t>> per_seg(num_segments);
+		std::vector<seconds> worker_gpu_times(num_workers, seconds::zero());
 		std::mutex err_mtx;
 		std::exception_ptr first_err = nullptr;
 
 		int prev_device = -1;
-		cudaGetDevice( &prev_device );
+		cudaGetDevice(&prev_device);
 
-		auto worker = [&]( int dev )
+		auto worker = [&](int dev)
 		{
-			try {
-				CU_ERR( cudaSetDevice( dev ) );
+			try
+			{
+				CU_ERR(cudaSetDevice(dev));
 
 				// Upload triangle graph + triangle list once per device.
-				thrust::device_vector<VERTEX_T> d_trisD( tgraph.D );
-				thrust::device_vector<EDGE_T>   d_trisO( tgraph.O );
-				thrust::device_vector<tri_t>    d_tris ( tris.begin(), tris.end() );
+				thrust::device_vector<VERTEX_T> d_trisD(tgraph.D);
+				thrust::device_vector<EDGE_T> d_trisO(tgraph.O);
+				thrust::device_vector<tri_t> d_tris(tris.begin(), tris.end());
 
-				for( size_t s = static_cast<size_t>( dev ); s < num_segments; s += num_workers )
+				seconds local_gpu_time = seconds::zero();
+
+				for (size_t s = static_cast<size_t>(dev); s < num_segments; s += num_workers)
 				{
 					const size_t vb = tgraph.split_parts[s];
-					const size_t ve = ( s + 1 < num_segments ) ? tgraph.split_parts[s+1] : num_tverts;
-					if( ve <= vb ) continue;
+					const size_t ve = (s + 1 < num_segments) ? tgraph.split_parts[s + 1] : num_tverts;
+					if (ve <= vb)
+						continue;
 
-					const size_t db = static_cast<size_t>( tgraph.O[vb] );
-					const size_t de = ( ve < num_tverts ) ? static_cast<size_t>( tgraph.O[ve] ) : num_triangles;
-					const size_t seg_size  = de - db; // number of triangles indexed by inner d/i1
+					const size_t db = static_cast<size_t>(tgraph.O[vb]);
+					const size_t de = (ve < num_tverts) ? static_cast<size_t>(tgraph.O[ve]) : num_triangles;
+					const size_t seg_size = de - db; // number of triangles indexed by inner d/i1
 					const size_t seg_verts = ve - vb;
-					if( seg_size == 0 ) continue;
+					if (seg_size == 0)
+						continue;
 
-					thrust::device_vector<VERTEX_T> d_DE_b( seg_size, 0 );
-					thrust::device_vector<VERTEX_T> d_DE_c( seg_size, 0 );
-					thrust::device_vector<EDGE_T>   d_OE_b( seg_size, 0 );
-					thrust::device_vector<EDGE_T>   d_OE_c( seg_size, 0 );
-					thrust::device_vector<EDGE_T>   d_N0  ( seg_size + 1, 0 );
-					thrust::device_vector<EDGE_T>   d_N1  ( seg_size + 1, 0 );
+					thrust::device_vector<VERTEX_T> d_DE_b(seg_size, 0);
+					thrust::device_vector<VERTEX_T> d_DE_c(seg_size, 0);
+					thrust::device_vector<EDGE_T> d_OE_b(seg_size, 0);
+					thrust::device_vector<EDGE_T> d_OE_c(seg_size, 0);
+					thrust::device_vector<EDGE_T> d_N0(seg_size + 1, 0);
+					thrust::device_vector<EDGE_T> d_N1(seg_size + 1, 0);
 
 					// Reset this device's global four-clique counter. Segments
 					// scheduled to the same device run serially within this
 					// thread, so the shared counter is safe.
+					auto t_gpu = hrc::now();
 					initialize_kernel<<<1, 1>>>();
-					CU_ERR( cudaDeviceSynchronize() );
+					CU_ERR(cudaDeviceSynchronize());
 
-					const dim3 nB_t( blocks( seg_size ), 1, 1 );
+					const dim3 nB_t(blocks(seg_size), 1, 1);
 					cu_take_quds_seg<<<nB_t, MAX_THRD_BLK>>>(
-							thrust::raw_pointer_cast( d_trisD.data() ),
-							thrust::raw_pointer_cast( d_trisO.data() ),
-							thrust::raw_pointer_cast( d_tris.data() ),
-							db,
-							seg_size,
-							thrust::raw_pointer_cast( d_DE_b.data() ),
-							thrust::raw_pointer_cast( d_DE_c.data() ),
-							thrust::raw_pointer_cast( d_OE_b.data() ),
-							thrust::raw_pointer_cast( d_OE_c.data() ) );
+						thrust::raw_pointer_cast(d_trisD.data()),
+						thrust::raw_pointer_cast(d_trisO.data()),
+						thrust::raw_pointer_cast(d_tris.data()),
+						db,
+						seg_size,
+						thrust::raw_pointer_cast(d_DE_b.data()),
+						thrust::raw_pointer_cast(d_DE_c.data()),
+						thrust::raw_pointer_cast(d_OE_b.data()),
+						thrust::raw_pointer_cast(d_OE_c.data()));
 
-					CU_ERR( cudaPeekAtLastError() );
-					CU_ERR( cudaDeviceSynchronize() );
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+					local_gpu_time += hrc::now() - t_gpu;
 
 					// Path counts (exact M0/M1 sizes, upper bound on quds).
-					auto const path_count_m0 = static_cast<size_t>( thrust::reduce( d_DE_b.begin(), d_DE_b.end() ) );
-					auto const path_count_m1 = static_cast<size_t>( thrust::reduce( d_DE_c.begin(), d_DE_c.end() ) );
+					t_gpu = hrc::now();
+					auto const path_count_m0 = static_cast<size_t>(thrust::reduce(d_DE_b.begin(), d_DE_b.end()));
+					auto const path_count_m1 = static_cast<size_t>(thrust::reduce(d_DE_c.begin(), d_DE_c.end()));
+					CU_ERR(cudaDeviceSynchronize());
+					local_gpu_time += hrc::now() - t_gpu;
 
-					thrust::device_vector<MTYPE> d_M0( path_count_m0, 1 );
-					thrust::device_vector<MTYPE> d_M1( path_count_m1, 1 );
-					thrust::device_vector<qud_t> d_quds( path_count_m0 ? path_count_m0 : 1 );
+					thrust::device_vector<MTYPE> d_M0(path_count_m0, 1);
+					thrust::device_vector<MTYPE> d_M1(path_count_m1, 1);
+					thrust::device_vector<qud_t> d_quds(path_count_m0 ? path_count_m0 : 1);
 
-					cu_multi_arrange( d_DE_b, d_OE_b, d_N0, d_M0 );
-					cu_multi_arrange( d_DE_c, d_OE_c, d_N1, d_M1 );
+					t_gpu = hrc::now();
+					cu_multi_arrange(d_DE_b, d_OE_b, d_N0, d_M0);
+					cu_multi_arrange(d_DE_c, d_OE_c, d_N1, d_M1);
 
-					const dim3 nB_v( blocks( seg_verts ), 1, 1 );
+					const dim3 nB_v(blocks(seg_verts), 1, 1);
 					cu_cliques_quds_seg<<<nB_v, MAX_THRD_BLK>>>(
-							thrust::raw_pointer_cast( d_tris.data() ),
-							thrust::raw_pointer_cast( d_trisO.data() ),
-							thrust::raw_pointer_cast( d_M0.data() ),
-							thrust::raw_pointer_cast( d_N0.data() ),
-							thrust::raw_pointer_cast( d_M1.data() ),
-							thrust::raw_pointer_cast( d_N1.data() ),
-							num_triangles,
-							num_tverts,
-							vb,
-							ve,
-							db,
-							thrust::raw_pointer_cast( d_quds.data() ),
-							d_quds.size() );
+						thrust::raw_pointer_cast(d_tris.data()),
+						thrust::raw_pointer_cast(d_trisO.data()),
+						thrust::raw_pointer_cast(d_M0.data()),
+						thrust::raw_pointer_cast(d_N0.data()),
+						thrust::raw_pointer_cast(d_M1.data()),
+						thrust::raw_pointer_cast(d_N1.data()),
+						num_triangles,
+						num_tverts,
+						vb,
+						ve,
+						db,
+						thrust::raw_pointer_cast(d_quds.data()),
+						d_quds.size());
 
-					CU_ERR( cudaPeekAtLastError() );
-					CU_ERR( cudaDeviceSynchronize() );
+					CU_ERR(cudaPeekAtLastError());
+					CU_ERR(cudaDeviceSynchronize());
+					local_gpu_time += hrc::now() - t_gpu;
 
 					size_t seg_count = 0;
-					CU_ERR( cudaMemcpyFromSymbol( &seg_count, d_global_num_4cliques
-					                            , sizeof( d_global_num_4cliques ), 0
-					                            , cudaMemcpyDeviceToHost ) );
-					if( seg_count > d_quds.size() ) {
-						throw std::runtime_error( "compute_fourcliques_parted: per-segment output capacity exceeded." );
+					CU_ERR(cudaMemcpyFromSymbol(&seg_count, d_global_num_4cliques, sizeof(d_global_num_4cliques), 0, cudaMemcpyDeviceToHost));
+					if (seg_count > d_quds.size())
+					{
+						throw std::runtime_error("compute_fourcliques_parted: per-segment output capacity exceeded.");
 					}
 
-					per_seg[s].resize( seg_count );
-					thrust::copy( d_quds.cbegin(), d_quds.cbegin() + seg_count, per_seg[s].begin() );
+					per_seg[s].resize(seg_count);
+					thrust::copy(d_quds.cbegin(), d_quds.cbegin() + seg_count, per_seg[s].begin());
 				}
-			} catch (...) {
-				std::lock_guard<std::mutex> lk( err_mtx );
-				if( !first_err ) first_err = std::current_exception();
+
+				worker_gpu_times[static_cast<size_t>(dev)] = local_gpu_time;
+			}
+			catch (...)
+			{
+				std::lock_guard<std::mutex> lk(err_mtx);
+				if (!first_err)
+					first_err = std::current_exception();
 			}
 		};
 
 		std::vector<std::thread> threads;
-		threads.reserve( num_workers );
-		for( size_t i = 0; i < num_workers; ++i ) {
-			threads.emplace_back( worker, static_cast<int>( i ) );
+		threads.reserve(num_workers);
+		for (size_t i = 0; i < num_workers; ++i)
+		{
+			threads.emplace_back(worker, static_cast<int>(i));
 		}
-		for( auto& t : threads ) t.join();
+		for (auto &t : threads)
+			t.join();
 
-		if( prev_device >= 0 ) cudaSetDevice( prev_device );
+		if (prev_device >= 0)
+			cudaSetDevice(prev_device);
 
-		if( first_err ) std::rethrow_exception( first_err );
+		if (first_err)
+			std::rethrow_exception(first_err);
 
+		if (gpu_time_out)
+		{
+			*gpu_time_out = worker_gpu_times.empty()
+								? seconds::zero()
+								: *std::max_element(worker_gpu_times.cbegin(), worker_gpu_times.cend());
+		}
+
+		return per_seg;
+	}
+
+	template <typename U, typename V>
+	std::vector<qud_t> compute_fourcliques_parted(const graph_t<U, V, 2> &tgraph,
+												  const std::vector<tri_t> &tris,
+												  seconds *gpu_time_out = nullptr)
+	{
+		auto per_seg = compute_fourcliques_parted_parts(tgraph, tris, gpu_time_out);
 		size_t total = 0;
-		for( const auto& v : per_seg ) total += v.size();
+		for (const auto &v : per_seg)
+			total += v.size();
+
 		std::vector<qud_t> all;
-		all.reserve( total );
-		for( auto& v : per_seg ) {
-			all.insert( all.end(), v.begin(), v.end() );
+		all.reserve(total);
+		for (auto &v : per_seg)
+		{
+			all.insert(all.end(), v.begin(), v.end());
 		}
 		return all;
 	}
 
 	// Returns free memory (bytes) on the specified device without changing the active device.
-	static size_t gpu_free_memory(int device_id) {
+	static size_t gpu_free_memory(int device_id)
+	{
 		int prev = -1;
 		cudaGetDevice(&prev);
-		if (device_id != prev) cudaSetDevice(device_id);
+		if (device_id != prev)
+			cudaSetDevice(device_id);
 		size_t free_bytes = 0, total_bytes = 0;
 		cudaMemGetInfo(&free_bytes, &total_bytes);
-		if (device_id != prev) cudaSetDevice(prev);
+		if (device_id != prev)
+			cudaSetDevice(prev);
 		return free_bytes;
 	}
 
 	// Enables unidirectional peer access so that kernels on `from_dev` can
 	// directly read/write memory allocated on `to_dev` (e.g. via NVLink).
 	// Returns true if peer access is now active.
-	static bool try_peer_access(int from_dev, int to_dev) {
+	static bool try_peer_access(int from_dev, int to_dev)
+	{
 		int capable = 0;
 		cudaDeviceCanAccessPeer(&capable, from_dev, to_dev);
-		if (!capable) return false;
+		if (!capable)
+			return false;
 		int prev = -1;
 		cudaGetDevice(&prev);
 		cudaSetDevice(from_dev);
 		cudaError_t err = cudaDeviceEnablePeerAccess(to_dev, 0);
-		if (prev != from_dev) cudaSetDevice(prev);
+		if (prev != from_dev)
+			cudaSetDevice(prev);
 		return err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled;
 	}
 
 	// Holds a raw CUDA device allocation that may live on a non-primary GPU.
 	// Kernels on GPU 0 can access it via NVLink peer access.
 	// When device == 0 (or no offload needed), ptr is a normal GPU 0 pointer.
-	struct PeerAlloc {
-		void*  ptr    = nullptr;
-		int    device = 0;   // device that owns ptr
-		size_t bytes  = 0;
+	struct PeerAlloc
+	{
+		void *ptr = nullptr;
+		int device = 0; // device that owns ptr
+		size_t bytes = 0;
 
 		// Allocate `n_bytes` on the best available device:
 		// prefer GPU 0 if it has >= MEM_SAFETY fraction free, otherwise spill
 		// to the first peer_devices entry that has enough room.
 		static PeerAlloc make(size_t n_bytes,
-							const std::vector<int>& peer_devices,
-							float mem_safety = 0.85f,
-							const char* label = "")
+							  const std::vector<int> &peer_devices,
+							  float mem_safety = 0.85f,
+							  const char *label = "")
 		{
 			PeerAlloc a;
 			a.bytes = n_bytes;
 
 			// Try primary device first
-			if (n_bytes <= static_cast<size_t>(gpu_free_memory(0) * mem_safety)) {
+			if (n_bytes <= static_cast<size_t>(gpu_free_memory(0) * mem_safety))
+			{
 				CU_ERR(cudaMalloc(&a.ptr, n_bytes));
 				a.device = 0;
 				return a;
 			}
 
 			// Spill to first peer with enough room
-			for (int peer : peer_devices) {
-				if (n_bytes <= static_cast<size_t>(gpu_free_memory(peer) * mem_safety)) {
-					int prev = -1; cudaGetDevice(&prev);
+			for (int peer : peer_devices)
+			{
+				if (n_bytes <= static_cast<size_t>(gpu_free_memory(peer) * mem_safety))
+				{
+					int prev = -1;
+					cudaGetDevice(&prev);
 					cudaSetDevice(peer);
 					CU_ERR(cudaMalloc(&a.ptr, n_bytes));
 					cudaSetDevice(prev);
 					a.device = peer;
 					std::cerr << "[multi-GPU] " << label << " ("
-							<< n_bytes / (1ul << 20) << " MiB) on GPU " << peer << "\n";
+							  << n_bytes / (1ul << 20) << " MiB) on GPU " << peer << "\n";
 					return a;
 				}
 			}
 
 			// Last resort: allocate on GPU 0 anyway (will throw on OOM)
 			std::cerr << "[multi-GPU] WARNING: no GPU has enough free memory for "
-					<< label << " (" << n_bytes / (1ul << 20)
-					<< " MiB). Trying GPU 0.\n";
+					  << label << " (" << n_bytes / (1ul << 20)
+					  << " MiB). Trying GPU 0.\n";
 			CU_ERR(cudaMalloc(&a.ptr, n_bytes));
 			a.device = 0;
 			return a;
 		}
 
-		void free_mem() {
-			if (!ptr) return;
-			int prev = -1; cudaGetDevice(&prev);
-			if (device != prev) cudaSetDevice(device);
+		void free_mem()
+		{
+			if (!ptr)
+				return;
+			int prev = -1;
+			cudaGetDevice(&prev);
+			if (device != prev)
+				cudaSetDevice(device);
 			cudaFree(ptr);
-			if (device != prev) cudaSetDevice(prev);
+			if (device != prev)
+				cudaSetDevice(prev);
 			ptr = nullptr;
 		}
 
 		// Run thrust::sort on the owning device, then return to GPU 0.
 		template <typename T>
-		void sort_on_owner(size_t count) {
-			int prev = -1; cudaGetDevice(&prev);
-			if (device != prev) cudaSetDevice(device);
-			thrust::sort(thrust::device_pointer_cast(static_cast<T*>(ptr)),
-						thrust::device_pointer_cast(static_cast<T*>(ptr)) + count);
-			if (device != prev) {
+		void sort_on_owner(size_t count)
+		{
+			int prev = -1;
+			cudaGetDevice(&prev);
+			if (device != prev)
+				cudaSetDevice(device);
+			thrust::sort(thrust::device_pointer_cast(static_cast<T *>(ptr)),
+						 thrust::device_pointer_cast(static_cast<T *>(ptr)) + count);
+			if (device != prev)
+			{
 				CU_ERR(cudaDeviceSynchronize());
 				cudaSetDevice(prev);
 			}
 		}
 
-		template <typename T> T* as() { return static_cast<T*>(ptr); }
+		template <typename T>
+		T *as() { return static_cast<T *>(ptr); }
 	};
 
 	// Function to run nvidia-smi and send to cerr
-	inline std::string nvidiaSmi() {
+	inline std::string nvidiaSmi()
+	{
 		// Execute command, capturing stdout
 		std::unique_ptr<FILE, decltype(&pclose)> pipe(popen("nvidia-smi", "r"), pclose);
-		if (!pipe) {
+		if (!pipe)
+		{
 			return "";
 		}
 		std::string result;
 		std::array<char, 128> buffer;
-		while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-			result += buffer.data();   // Append to result string
+		while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
+		{
+			result += buffer.data(); // Append to result string
 		}
 		return result;
 	}
 
-	std::vector<int> get_peer_devices() {
+	std::vector<int> get_peer_devices()
+	{
 		int num_devices = 0;
 		CU_ERR(cudaGetDeviceCount(&num_devices));
 		std::vector<int> peers;
-		for (int i = 1; i < num_devices; i++) {
+		for (int i = 1; i < num_devices; i++)
+		{
 			bool ok = try_peer_access(0, i) && try_peer_access(i, 0);
-			if (ok) {
+			if (ok)
+			{
 				peers.push_back(i);
 			}
 		}

@@ -67,6 +67,9 @@ inline RET round(T val, size_t precision=2) {
 	auto tens = std::pow(10., precision);
 	return static_cast<RET>(std::ceil(val * tens) / tens);
 }
+	
+#define SET_STEP(s) do { step = (s); std::cerr << "[phase] " << step << std::endl; } while(0)
+
 
 
 #endif // DEFS_HPP_
